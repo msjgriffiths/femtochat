@@ -38,19 +38,19 @@ function(👀::CausalSelfAttention)(x::AbstractMatrix)
     👀.ℙ(y)
 end
 
-function attention(Q::Matrix, K::Matrix, V::Matrix, window)
-    # TODO: reference implementationx
-    x
-end
-
-function attention(Q::CuMatrix, K::CuMatrix, V::CuMatrix, window)
-    # TODO: FA2 or FA3
-end
-
 function (𝔹::Block)(x::AbstractMatrix)
     x = x + 𝔹.👀(norm(x))
     x = x + 𝔹.🧠(norm(x))
 end
 
+function (ω::🤖)(tokens)
+    x = ω.transformer.embed(tokens)
+
+    for (i, block) in enumerate(ω.transformer.blocks)
+        x = block(x, ω.window_sizes[i])
+    end
+
+    ω.lm_head(x)
+end
 
 end
