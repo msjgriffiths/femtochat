@@ -39,8 +39,8 @@ function(👀::CausalSelfAttention)(x::AbstractMatrix)
 end
 
 function (𝔹::Block)(x::AbstractMatrix)
-    x = x + 𝔹.👀(norm(x))
-    x = x + 𝔹.🧠(norm(x))
+    x .+= 𝔹.👀(norm(x)) # Residual highway
+    x .+= 𝔹.🧠(norm(x)) # Residual highway
 end
 
 function (ω::🤖)(tokens)
