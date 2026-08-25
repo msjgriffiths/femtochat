@@ -6,8 +6,23 @@ function norm(x)
     """TODO: Build RMSnorm"""
 end
 
-(□::Linear)(x::AbstractMatrix) = □.𝕎 * x
-(𝔼::Embedding)(token_ids::AbstractVector{Int}) = 𝔼.𝔼[:, token_ids]
+function (ℓ::Linear)(x::AbstractArray)
+    Din = size(x, 1)
+
+    X = reshape(x, Din, :)
+    Y = ℓ.𝕎 * X
+
+    reshape(Y, size(ℓ.𝕎, 1), Base.tail(size(x))...)
+end
+
+(𝔼::Embedding)(token_ids::AbstractVector{<:Integer}) = 𝔼.𝔼[:, token_ids]
+function (e::Embedding)(tokens::AbstractMatrix{<:Integer})
+    D = size(e.𝔼, 1)
+    T, B = size(tokens)
+
+    reshape(e.𝔼[:, vec(tokens)], D, T, B)
+end
+
 function (m::MLP)(x::AbstractMatrix)
     x = m.𝔽(x)
     x = max.(x, zero(eltype(x))) .^ 2
