@@ -43,7 +43,7 @@ function (𝔹::Block)(x::AbstractMatrix)
     x .+= 𝔹.🧠(norm(x)) # Residual highway
 end
 
-function (ω::🤖)(tokens)
+function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     x = ω.transformer.embed(tokens)
 
     for (i, block) in enumerate(ω.transformer.blocks)
