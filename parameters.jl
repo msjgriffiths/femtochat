@@ -484,6 +484,14 @@ function 🤖(
     )
 end
 
+function 🤖🤝🤖(
+    params::Params,
+    config::GPTConfig,
+    layout,
+)
+    # TODO: Implement Mixture of Experts
+end
+
 # -----------------------------------------------------------------------------
 # Display
 # -----------------------------------------------------------------------------
