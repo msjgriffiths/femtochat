@@ -2,6 +2,10 @@
 module GPT
 using ..Parameters
 
+function sigmoid(x)
+    @. 1 / (1 + exp(-x))
+end
+
 function norm(x)
     """TODO: Build RMSnorm"""
 end
@@ -29,17 +33,22 @@ function (m::MLP)(x::AbstractMatrix)
     m.ℙ(x)
 end
 
-function(👀::CausalSelfAttention)(x::AbstractMatrix)
+function(👀::CausalSelfAttention)(x::AbstractMatrix, ve::Union{Nothing,AbstractMatrix} = nothing)
     # TODO: Implement causal self-attention with value embedding and rotary embedding and kb cache
+    C, T, B = size(x)
+    
     Q = 👀.𝕎(x)
     K = 👀.𝕂(x)
     V = 👀.𝕍(x)
-    y = attention(Q, K, V, window)
+    if !isnothing(👀.𝕧𝕖)
+       V .+= 3sigmoid(👀.𝕧𝕖(x[1:12, :])) .* ve
+    end
+    y = attention(Q, K, V, 👀.window)
     👀.ℙ(y)
 end
 
-function (𝔹::Block)(x::AbstractMatrix)
-    x .+= 𝔹.👀(norm(x)) # Residual highway
+function (𝔹::Block)(x::AbstractMatrix, ve::Union{Nothing,AbstractMatrix} = nothing)
+    x .+= 𝔹.👀(norm(x), ve) # Residual highway
     x .+= 𝔹.🧠(norm(x)) # Residual highway
 end
 

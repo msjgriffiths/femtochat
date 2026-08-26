@@ -100,7 +100,8 @@ struct CausalSelfAttention{L<:Linear}
     𝕍::L
     ℙ::L
     𝕧𝕖::Union{Nothing,L}
-end
+    window::Tuple{Int,Int}
+end 
 
 """
 Attention block
@@ -182,6 +183,18 @@ Whether a transformer layer uses a value embedding.
 """
 has_ve(layer_idx::Int, n_layer::Int) =
     (layer_idx - 1) % 2 == (n_layer - 1) % 2
+
+function window_sizes(config::GPTConfig)
+    pattern = collect(config.window_pattern)
+    L = config.sequence_len
+    # Short is 4x smaller than long, and rounded up to a multiple of 128
+    # ... so long as it's not longer than the long sequence length.
+    S = min(L, cld(L, 4*128) * 128)
+    windows = [pattern[mod1(i, length(pattern))] == 'S' ? (S, 0) : (L, 0) for i in 1:config.n_layer]
+    # Force last layer to be full-length
+    windows[end]  = (L, 0)
+    windows
+end
 
 
 """
@@ -345,6 +358,7 @@ function Block(
     Θ::AbstractVector,
     layout,
     layer_idx::Int,
+    window::Tuple{Int,Int},
 )
     👀 = layout.👀
 
@@ -359,6 +373,7 @@ function Block(
         Linear(Θ, 👀.𝕍),
         Linear(Θ, 👀.ℙ),
         𝕧𝕖,
+        window
     )
 
     🧠 = layout.🧠
@@ -374,14 +389,17 @@ end
 function Transformer(
     Θ::AbstractVector,
     layout,
+    config::GPTConfig,
 )
     embedding = Embedding(
         Θ,
         layout.embedding,
     )
 
+    windows = window_sizes(config)
+
     blocks = [
-        Block(Θ, block_layout, layer_idx)
+        Block(Θ, block_layout, layer_idx, windows[layer_idx])
         for (layer_idx, block_layout) in enumerate(layout.blocks)
     ]
 
@@ -390,19 +408,6 @@ function Transformer(
         blocks,
     )
 end
-
-function window_sizes(config::GPTConfig)
-    pattern = collect(config.window_pattern)
-    L = config.sequence_len
-    # Short is 4x smaller than long, and rounded up to a multiple of 128
-    # ... so long as it's not longer than the long sequence length.
-    S = min(L, cld(L, 4*128) * 128)
-    windows = [pattern[mod1(i, length(pattern))] == 'S' ? (S, 0) : (L, 0) for i in 1:config.n_layer]
-    # Force last layer to be full-length
-    windows[end]  = (L, 0)
-    windows
-end
-
 
 """
 Construct a GPT model whose trainable tensors are zero-copy views into
