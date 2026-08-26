@@ -33,18 +33,22 @@ function (m::MLP)(x::AbstractMatrix)
     m.ℙ(x)
 end
 
-function(👀::CausalSelfAttention)(x::AbstractMatrix, ve::Union{Nothing,AbstractMatrix} = nothing)
+function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, ve::Union{Nothing,AbstractMatrix} = nothing)
     # TODO: Implement causal self-attention with value embedding and rotary embedding and kb cache
+
+    (; 𝕎, 𝕂, 𝕍, ℙ, 𝕧𝕖, head_dim, n_head, n_kv_head, window) = 👀
     C, T, B = size(x)
     
-    Q = 👀.𝕎(x)
-    K = 👀.𝕂(x)
-    V = 👀.𝕍(x)
-    if !isnothing(👀.𝕧𝕖)
-       V .+= 3sigmoid(👀.𝕧𝕖(x[1:12, :])) .* ve
+    Q = 𝕎(x) |> q -> reshape(q, head_dim, n_head, T, B)
+    K = 𝕂(x) |> k -> reshape(k, head_dim, n_kv_head, T, B)
+    V = 𝕍(x) |> v -> reshape(v, head_dim, n_kv_head, T, B)
+    if !isnothing(𝕧𝕖)
+        VE = reshape(ve, head_dim, n_kv_head, T, B)
+        gate = 3sigmoid(𝕧𝕖(x[1:12, :, :])) .* ve
+        V .+= reshape(gate, 1, n_kv_head, T, B) .* VE
     end
-    y = attention(Q, K, V, 👀.window)
-    👀.ℙ(y)
+    y = attention(Q, K, V, window)
+    ℙ(y)
 end
 
 function (𝔹::Block)(x::AbstractMatrix, ve::Union{Nothing,AbstractMatrix} = nothing)
