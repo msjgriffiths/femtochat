@@ -49,7 +49,7 @@ function apply_rotary_embedding(X, cos, sin)
     y₂ = @view Y[d+1:end, :, :, :]
 
     @. y₁ = x₁ * c + x₂ * s
-    @. y₂ = -x₁ * s + x₂ * c
+    @. y₂ = x₁ * -s + x₂ * c
 
     Y
 end
@@ -77,8 +77,8 @@ function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Unio
     rope_sin, rope_cos = sin_cos
     Q = apply_rotary_embedding(Q, rope_cos, rope_sin)
     K = apply_rotary_embedding(K, rope_cos, rope_sin)
-
-
+    Q = norm(Q) .* 1.2
+    K = norm(K) .* 1.2
 
     y = attention(Q, K, V, window)
     ℙ(y)
