@@ -133,7 +133,7 @@ struct 🤖{
     SL<:AbstractVector{<:ParamFloat},
     BL<:AbstractVector{<:ParamFloat},
     V<:AbstractVector{<:Embedding},
-    R<:AbstractMatrix{<:AbstractFloat},
+    R<:Tuple{AbstractMatrix{<:AbstractFloat}, AbstractMatrix{<:AbstractFloat}},
 }
     config::GPTConfig
 
@@ -153,8 +153,7 @@ struct 🤖{
     value_embeds::V
 
     rotary_seq_len::Int
-    rope_cos::R
-    rope_sin::R  
+    rope_sin_cos::R
 end
 
 # -----------------------------------------------------------------------------
@@ -439,7 +438,7 @@ function rotary_embeddings(
     inv_freq = @. 1f0 / base^(channel_range / head_dim)
     freqs = inv_freq * t'
 
-    return cos.(freqs), sin.(freqs)
+    return sin.(freqs), cos.(freqs)
 end
 
 """
@@ -501,11 +500,11 @@ function 🤖(
         for ve in layout.value_embeds
     ]
 
-    rope_cos, rope_sin = rotary_embeddings(
-    params.Θ,
-    rotary_seq_len,
-    head_dim,
-)
+    rope_sin_cos = rotary_embeddings(
+        typeof(Θ),
+        config.sequence_len,
+        config.n_embed ÷ config.n_head,
+    )
 
     🤖(
         config,
@@ -525,8 +524,7 @@ function 🤖(
         value_embeds,
 
         10config.sequence_len,
-        rope_cos,
-        rope_sin
+        rope_sin_cos
     )
 end
 
