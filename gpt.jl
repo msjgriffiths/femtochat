@@ -43,9 +43,9 @@ function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, ve::Union{Nothing
     K = 𝕂(x) |> k -> reshape(k, head_dim, n_kv_head, T, B)
     V = 𝕍(x) |> v -> reshape(v, head_dim, n_kv_head, T, B)
     if !isnothing(𝕧𝕖)
-        VE = reshape(ve, head_dim, n_kv_head, T, B)
-        gate = 3sigmoid(𝕧𝕖(x[1:12, :, :])) .* ve
-        V .+= reshape(gate, 1, n_kv_head, T, B) .* VE
+        VE = reshape(ve, head_dim, n_kv_head, T, B) # Match shape of V above 
+        gate = 3sigmoid(𝕧𝕖(x[1:12, :, :]))
+        V .+= reshape(gate, 1, n_kv_head, T, B) .* VE # Residual connection
     end
     y = attention(Q, K, V, window)
     ℙ(y)
