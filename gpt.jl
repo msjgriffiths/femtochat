@@ -35,29 +35,23 @@ end
 
 function apply_rotary_embedding(X, cos, sin)
     head_dim, n_head, T, B = size(X)
+    d = head_dim ÷ 2
 
-    # Expose adjacent channel pairs
-    X₂ = reshape(X, 2, head_dim ÷ 2, n_head, T, B)
+    x₁ = @view X[1:d, :, :, :]
+    x₂ = @view X[d+1:end, :, :, :]
 
-    x₁ = @view X₂[1, :, :, :, :]
-    x₂ = @view X₂[2, :, :, :, :]
+    c = reshape(@view(cos[:, 1:T]), d, 1, T, 1)
+    s = reshape(@view(sin[:, 1:T]), d, 1, T, 1)
 
-    # Output buffer
-    Y₂ = similar(X₂)
+    Y = similar(X)
 
-    y₁ = @view Y₂[1, :, :, :, :]
-    y₂ = @view Y₂[2, :, :, :, :]
+    y₁ = @view Y[1:d, :, :, :]
+    y₂ = @view Y[d+1:end, :, :, :]
 
-    # RoPE lookup for positions in this sequence.
-    # Shape: (head_dim/2) × 1 × T × 1
-    c = reshape(@view(cos[:, 1:T]), head_dim ÷ 2, 1, T, 1)
-    s = reshape(@view(sin[:, 1:T]), head_dim ÷ 2, 1, T, 1)
+    @. y₁ = x₁ * c + x₂ * s
+    @. y₂ = -x₁ * s + x₂ * c
 
-    # Rotate each adjacent channel pair
-    @. y₁ = x₁ * c - x₂ * s
-    @. y₂ = x₁ * s + x₂ * c
-
-    reshape(Y₂, size(X)...)
+    Y
 end
 
 
@@ -81,6 +75,8 @@ function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Unio
 
     # Rotary Embedding (RoPE) from https://arxiv.org/abs/2104.09864
     rope_sin, rope_cos = sin_cos
+    Q = apply_rotary_embedding(Q, rope_cos, rope_sin)
+    K = apply_rotary_embedding(K, rope_cos, rope_sin)
 
 
 
