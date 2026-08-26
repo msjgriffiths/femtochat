@@ -101,6 +101,9 @@ struct CausalSelfAttention{L<:Linear}
     ℙ::L
     𝕧𝕖::Union{Nothing,L}
     window::Tuple{Int,Int}
+    head_dim::Int
+    n_head::Int
+    n_kv_head::Int
 end 
 
 """
@@ -130,6 +133,7 @@ struct 🤖{
     SL<:AbstractVector{<:ParamFloat},
     BL<:AbstractVector{<:ParamFloat},
     V<:AbstractVector{<:Embedding},
+    R<:AbstractMatrix{<:AbstractFloat},
 }
     config::GPTConfig
 
@@ -149,6 +153,8 @@ struct 🤖{
     value_embeds::V
 
     rotary_seq_len::Int
+    rope_cos::R
+    rope_sin::R  
 end
 
 # -----------------------------------------------------------------------------
@@ -359,6 +365,9 @@ function Block(
     layout,
     layer_idx::Int,
     window::Tuple{Int,Int},
+    head_dim::Int,
+    n_head::Int,
+    n_kv_head::Int,
 )
     👀 = layout.👀
 
@@ -373,7 +382,10 @@ function Block(
         Linear(Θ, 👀.𝕍),
         Linear(Θ, 👀.ℙ),
         𝕧𝕖,
-        window
+        window,
+        head_dim,
+        n_head,
+        n_kv_head
     )
 
     🧠 = layout.🧠
@@ -399,7 +411,7 @@ function Transformer(
     windows = window_sizes(config)
 
     blocks = [
-        Block(Θ, block_layout, layer_idx, windows[layer_idx])
+        Block(Θ, block_layout, layer_idx, windows[layer_idx], config.n_embed ÷ config.n_head, config.n_head, config.n_kv_head)
         for (layer_idx, block_layout) in enumerate(layout.blocks)
     ]
 
@@ -407,6 +419,27 @@ function Transformer(
         embedding,
         blocks,
     )
+end
+
+function rotary_embeddings(
+    ::Type{A},
+    seq_len::Int,
+    head_dim::Int,
+    base::AbstractFloat = 100_000f0,
+) where {A<:AbstractArray}
+
+    channel_range = A{Float32}(undef, head_dim ÷ 2)
+    t = A{Float32}(undef, seq_len)
+
+    # Mathematically these start at zero
+    # We'll set up basic ranges and subtract 1 from them to get the correct values
+    channel_range .= 1:2:head_dim .- 1
+    t .= 1:seq_len .- 1
+
+    inv_freq = @. 1f0 / base^(channel_range / head_dim)
+    freqs = inv_freq * t'
+
+    return cos.(freqs), sin.(freqs)
 end
 
 """
@@ -468,6 +501,12 @@ function 🤖(
         for ve in layout.value_embeds
     ]
 
+    rope_cos, rope_sin = rotary_embeddings(
+    params.Θ,
+    rotary_seq_len,
+    head_dim,
+)
+
     🤖(
         config,
         window_sizes(config),
@@ -486,6 +525,8 @@ function 🤖(
         value_embeds,
 
         10config.sequence_len,
+        rope_cos,
+        rope_sin
     )
 end
 
