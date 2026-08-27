@@ -61,12 +61,15 @@ function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Unio
     (; 𝕎, 𝕂, 𝕍, ℙ, 𝕧𝕖, head_dim, n_head, n_kv_head, window) = 👀
     C, T, B = size(x)
     
-    Q = 𝕎(x) |> q -> reshape(q, head_dim, n_head, T, B)
+    Q = 𝕎(x) |> q -> reshape(q, head_dim, n_head,    T, B)
     K = 𝕂(x) |> k -> reshape(k, head_dim, n_kv_head, T, B)
     V = 𝕍(x) |> v -> reshape(v, head_dim, n_kv_head, T, B)
     
     # Value Residual Learning (ResFormer) from https://arxiv.org/abs/2410.17897
     # Not to be confused with ResFormer from ViTs
+    # This is really nothing like ResFormer, because it adds another token embedding - 
+    # ... where each layer gets its own embedding matrix.
+    # ... as opposed to a skip connection from an earlier (first) layer (ResFormer)
     if !isnothing(𝕧𝕖)
         VE = reshape(ve, head_dim, n_kv_head, T, B) # Match shape of V above 
         gate = 3sigmoid(𝕧𝕖(x[1:12, :, :])) # Range (0, 3)
