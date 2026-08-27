@@ -113,6 +113,7 @@ Attention is 👀 since it looks at everything, and 🧠 is a callback to old Pe
 struct Block 
     👀::CausalSelfAttention
     🧠::MLP
+    🍰::Embedding
 end
 
 struct Transformer{
@@ -463,6 +464,7 @@ function 🤖(
     transformer = Transformer(
         Θ,
         layout.transformer,
+        config
     )
 
     lm_head = Linear(
