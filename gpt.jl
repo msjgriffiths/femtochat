@@ -141,9 +141,25 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     logits
 end
 
-function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractVector)
+function logsumexp(x; dims=1)
+    m = maximum(x; dims)
+    m .+ log.(sum(exp.(x .- m); dims))
+end
+
+function cross_entropy(logits, targets; ignore_index=-1)
+    logits = reshape(logits, size(logits, 1), :)
+    targets = vec(targets)
+    valid = findall(!=(ignore_index), targets)
+
+    losses = vec(logsumexp(logits[:, valid])) .-
+             logits[CartesianIndex.(targets[valid], valid)]
+
+    mean(losses)
+end
+
+function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray{<:Integer})
     logits = ω(tokens)
-    # TODO: Apply cross entropy here
+    cross_entropy(logits, targets)
 end
 
 function uniform!(ℛ, Θ::AbstractVector, spec::ParamSpec, low, high)
