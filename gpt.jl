@@ -9,7 +9,7 @@ end
 
 Σ = sum
 
-function norm(x, ϵ=1f-6)
+function norm(x, ϵ=eps(Float32))
     D = size(x, 1) # Since we're column orientated, first dimension is token embedding size
     x ./ sqrt.(Σ(abs2, x; dims=1) ./ D .+ ϵ )
 end
@@ -100,6 +100,7 @@ end
 
 function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     (; λᵧ, λₛ) = ω
+    (; n_layer, vocab_size = ω.config)
     x = ω.transformer.embed(tokens)
     sin_cos = ω.rope_sin_cos
     x = norm(x)
@@ -110,7 +111,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     x₀ = x
 
     x_backout = nothing
-    backout_layer = (ω.config.n_layer - 1) ÷ 2
+    backout_layer = (n_layer - 1) ÷ 2
     for (i, block) in enumerate(ω.transformer.blocks)
         (; 🍰, λᵦ, λx₀) = block
         x = @. λᵦ * x + λx₀ * x₀ # X is linear interpolation between the original x and the current x
@@ -132,7 +133,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     x = norm(x)
 
     softcap = 15f0
-    logits = ω.lm_head(x)
+    logits = ω.lm_head(x)[:1:vocab_size, :, :]
     @. logits = softcap * tanh(logits / softcap)
     logits
 end
