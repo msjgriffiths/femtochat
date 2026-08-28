@@ -114,7 +114,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     x₀ = x
 
     x_backout = nothing
-    backout_layer = n_layer ÷ 2 - 1
+    backout_layer = n_layer ÷ 2 + 1
     for (i, block) in enumerate(ω.transformer.blocks)
         (; 🍰, λᵦ, λx₀) = block
         x = @. λᵦ * x + λx₀ * x₀ # X is linear interpolation between the original x and the current x
