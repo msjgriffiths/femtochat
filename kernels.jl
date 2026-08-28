@@ -5,11 +5,11 @@ using CUDA: CuMatrix
 
 export attention, softmax!
 
-function attention_mask(T, window::Tuple{Int,Int})
+function attention_mask(T, window)
     left, right = window
 
     if window == (-1, 0)
-        UpperTriangular(trues(T, T))
+        Matrix(UpperTriangular(trues(T, T)))
     else
         [q - left <= k <= q + right for k in 1:T, q in 1:T]
     end
