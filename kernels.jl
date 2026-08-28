@@ -3,6 +3,8 @@ module Kernels
 using LinearAlgebra: mul!, UpperTriangular
 using CUDA: CuMatrix
 
+export attention, softmax!
+
 function attention_mask(T, window::Tuple{Int,Int})
     left, right = window
 

@@ -149,7 +149,7 @@ struct 🤖{
 
     smear_gate::S
     smear_lambda::SL
-    backout_lambda::BL
+    λᵧ::BL
 
     value_embeds::V
 
@@ -318,7 +318,7 @@ function parameter_layout(
     smear_gate = take(1, 24)
 
     smear_lambda = take(1)
-    backout_lambda = take(1)
+    λᵧ = take(1)
 
 
     # -------------------------------------------------------------------------
@@ -349,7 +349,7 @@ function parameter_layout(
 
         smear_gate = smear_gate,
         smear_lambda = smear_lambda,
-        backout_lambda = backout_lambda,
+        λᵧ = λᵧ,
 
         value_embeds = value_embeds,
 
@@ -492,9 +492,9 @@ function 🤖(
         layout.smear_lambda,
     )
 
-    backout_lambda = paramview(
+    λᵧ = paramview(
         Θ,
-        layout.backout_lambda,
+        layout.λᵧ,
     )
 
     value_embeds = [
@@ -521,7 +521,7 @@ function 🤖(
 
         smear_gate,
         smear_lambda,
-        backout_lambda,
+        λᵧ,
 
         value_embeds,
 

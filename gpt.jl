@@ -31,7 +31,7 @@ function (e::Embedding)(tokens::AbstractMatrix{<:Integer})
     reshape(e.𝔼[:, vec(tokens)], D, T, B)
 end
 
-function (m::MLP)(x::AbstractMatrix)
+function (m::MLP)(x::AbstractArray)
     x = m.𝔽(x)
     x = max.(x, zero(eltype(x))) .^ 2
     m.ℙ(x)
@@ -98,6 +98,7 @@ function (𝔹::Block)(x::AbstractArray, ve::Union{Nothing,AbstractArray} = noth
 end
 
 function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
+    (; λᵦ, λx₀, λᵧ, λₛ) = ω
     x = ω.transformer.embed(tokens)
     sin_cos = ω.rope_sin_cos
     x = norm(x)
@@ -109,7 +110,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     x_backout = nothing
     backout_layer = ω.config.n_layer ÷ 2
     for (i, block) in enumerate(ω.transformer.blocks)
-        x = λᵦ * x + λx₀ * x₀ # X is linear interpolation between the original x and the current x
+        x = λᵦ[i] * x + λx₀[i] * x₀ # X is linear interpolation between the original x and the current x
         # Get value embedding matrix from this block given tokens
          ve = isnothing(ω.𝕧𝕖) ? nothing : block.🍰(tokens)
         x = block(x, ve, sin_cos)
@@ -120,7 +121,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
 
     if !isnothing(x_backout)
         # Subtract mid-layer residual to remove low-level features before logit projection
-        x -= ω.backout_lambda * x_backout
+        x -= λᵧ * x_backout
     end
 
     x = norm(x)
