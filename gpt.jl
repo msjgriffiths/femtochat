@@ -60,7 +60,7 @@ function apply_rotary_embedding(X, cos, sin)
 end
 
 
-function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Union{Nothing,AbstractMatrix} = nothing)
+function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Union{Nothing,AbstractArray} = nothing)
     # TODO: Implement causal self-attention with value embedding and rotary embedding and kb cache
 
     (; 𝕎, 𝕂, 𝕍, ℙ, 𝕧𝕖, head_dim, n_head, n_kv_head, window) = 👀
@@ -99,21 +99,25 @@ function (𝔹::Block)(x::AbstractArray, ve::Union{Nothing,AbstractArray} = noth
 end
 
 function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
-    (; λᵦ, λx₀, λᵧ, λₛ) = ω
+    (; λᵧ, λₛ) = ω
     x = ω.transformer.embed(tokens)
     sin_cos = ω.rope_sin_cos
     x = norm(x)
 
     # TODO: Smear
+    #ω.smear_gate(x(:, 2:end, 1:24))
 
     x₀ = x
 
     x_backout = nothing
     backout_layer = ω.config.n_layer ÷ 2
     for (i, block) in enumerate(ω.transformer.blocks)
-        x = λᵦ[i] * x + λx₀[i] * x₀ # X is linear interpolation between the original x and the current x
+        (; 🍰, λᵦ, λx₀) = block
+        x = @. λᵦ * x + λx₀ * x₀ # X is linear interpolation between the original x and the current x
         # Get value embedding matrix from this block given tokens
-         ve = isnothing(ω.value_embeds[i]) ? nothing : block.🍰(tokens)
+        # We pull out embedding matrix here because we have tokens here, instead of 
+        # passing token indexes down. 
+        ve = isnothing(🍰) ? nothing : 🍰(tokens)
         x = block(x, ve, sin_cos)
         if i == backout_layer
             x_backout = x

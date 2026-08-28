@@ -114,6 +114,8 @@ struct Block
     👀::CausalSelfAttention
     🧠::MLP
     🍰::Union{Nothing,Embedding}
+    λᵦ::AbstractVector{<:ParamFloat}
+    λx₀::AbstractVector{<:ParamFloat}
 end
 
 struct Transformer{
@@ -128,8 +130,6 @@ struct 🤖{
     T<:Transformer,
     L<:Linear,
     W<:AbstractVector{Tuple{Int,Int}},
-    E<:AbstractVector{<:ParamFloat},
-    X<:AbstractVector{<:ParamFloat},
     S<:Linear,
     SL<:AbstractVector{<:ParamFloat},
     BL<:AbstractVector{<:ParamFloat},
@@ -142,9 +142,6 @@ struct 🤖{
 
     transformer::T
     lm_head::L
-
-    λᵦ::E
-    λx₀::X
 
     smear_gate::S
     λₛ::SL # smear lambda
@@ -276,7 +273,10 @@ function parameter_layout(
 
             🍰 = (
                 𝔼 = has_ve(layer_idx, config.n_layer) ? take(kv_dim, padded_vocab_size) : nothing,
-            )
+            ),
+
+            λᵦ = take(1),
+            λx₀ = take(1),
         )
         for layer_idx in 1:config.n_layer
     ]
@@ -292,14 +292,6 @@ function parameter_layout(
     # -------------------------------------------------------------------------
 
     lm_head = take(padded_vocab_size, d)
-
-
-    # -------------------------------------------------------------------------
-    # Per-layer learned scalars
-    # -------------------------------------------------------------------------
-
-    λᵦ = take(config.n_layer)
-    λx₀ = take(config.n_layer)
 
 
     # -------------------------------------------------------------------------
@@ -321,9 +313,6 @@ function parameter_layout(
         transformer = transformer,
 
         lm_head = lm_head,
-
-        λᵦ = λᵦ,
-        λx₀ = λx₀,
 
         smear_gate = smear_gate,
         λₛ = λₛ,
@@ -375,7 +364,10 @@ function Block(
         nothing :
         Embedding(Θ, layout.🍰.𝔼)
 
-    Block(attention, mlp, 🍰)
+    λᵦ = paramview(Θ, layout.λᵦ)
+    λx₀ = paramview(Θ, layout.λx₀)
+
+    Block(attention, mlp, 🍰, λᵦ, λx₀)
 end
 
 function Transformer(
@@ -452,16 +444,6 @@ function 🤖(
         layout.lm_head,
     )
 
-    λᵦ = paramview(
-        Θ,
-        layout.λᵦ,
-    )
-
-    λx₀ = paramview(
-        Θ,
-        layout.λx₀,
-    )
-
     smear_gate = Linear(
         Θ,
         layout.smear_gate,
@@ -490,9 +472,6 @@ function 🤖(
 
         transformer,
         lm_head,
-
-        λᵦ,
-        λx₀,
 
         smear_gate,
         λₛ,
