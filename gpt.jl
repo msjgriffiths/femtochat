@@ -163,7 +163,7 @@ function initialize!(params::Params, layout, ℛ = 42)
 
     paramview(Θ, embedding) .= .8f0 .* randn(ℛ, Float32, embedding.shape)
     paramview(Θ, lm_head) .= 0.001f0 .* randn(ℛ, Float32, layout.lm_head.shape)
-    for (i, block) in blocks
+    for (i, block) in enumerate(blocks)
         (; 👀, 🍰, λᵦ, λx₀) = block
         (; 𝕎, 𝕂, 𝕍, ℙ, 𝕧𝕖) = 👀
         uniform!(ℛ, Θ, 𝕎, -s, s)
