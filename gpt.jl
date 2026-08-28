@@ -126,7 +126,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
 
     if !isnothing(x_backout)
         # Subtract mid-layer residual to remove low-level features before logit projection
-        x -= λᵧ * x_backout
+        x = @. x - λᵧ * x_backout
     end
 
     x = norm(x)
