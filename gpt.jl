@@ -1,5 +1,6 @@
 
 module GPT
+using Random
 using ..Parameters
 using ..Kernels
 
@@ -152,7 +153,7 @@ function uniform!(ℛ, Θ::AbstractVector, spec::ParamSpec, low, high)
     return nothing
 end
 
-function initialize!(params::Params, layout, ℛ = 42)
+function initialize!(params::Params, layout, ℛ = Random.default_rng())
     (; Θ) = params
     (; blocks, embedding) = layout.transformer
     (; lm_head, smear_gate, λₛ, λᵧ) = layout
