@@ -6,6 +6,7 @@ using ..Kernels
 function sigmoid(x)
     @. 1 / (1 + exp(-x))
 end
+σ = sigmoid
 
 Σ = sum
 
@@ -106,7 +107,9 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     x = norm(x)
 
     # TODO: Smear
-    #ω.smear_gate(x(:, 2:end, 1:24))
+    gate = @. λₛ * σ(ω.smear_gate(x[1:24, 2:end, :]))
+    xₛ = copy(x) # Create a copy to read from to avoid race condition updating values
+    @views x[:, 2:end, :] .+=  gate .* xₛ[:, 1:end-1, :]
 
     x₀ = x
 
@@ -141,6 +144,10 @@ end
 function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractVector)
     logits = ω(tokens)
     # TODO: Apply cross entropy here
+end
+
+function initialize!(θ, layout)
+
 end
 
 end
