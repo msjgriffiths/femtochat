@@ -7,8 +7,11 @@ function sigmoid(x)
     @. 1 / (1 + exp(-x))
 end
 
-function norm(x)
-    """TODO: Build RMSnorm"""
+Σ = sum
+
+function norm(x, ϵ=1f-6)
+    D = size(x, 1) # Since we're column orientated, first dimension is token embedding size
+    x ./ sqrt.(Σ(abs2, x; dims=1) ./ D .+ ϵ )
 end
 
 function (ℓ::Linear)(x::AbstractArray)
