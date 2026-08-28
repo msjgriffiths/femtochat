@@ -425,13 +425,19 @@ function 🤖(
     config::GPTConfig,
     layout,
 )
-    length(params.Θ) == layout.nparams ||
+    🤖(params.Θ, config, layout)
+end
+
+function 🤖(
+    Θ::AbstractVector{<:ParamFloat},
+    config::GPTConfig,
+    layout,
+)
+    length(Θ) == layout.nparams ||
         throw(DimensionMismatch(
-            "parameter vector has $(length(params.Θ)) elements, " *
+            "parameter vector has $(length(Θ)) elements, " *
             "but model layout requires $(layout.nparams)"
         ))
-
-    Θ = params.Θ
 
     transformer = Transformer(
         Θ,
