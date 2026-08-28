@@ -144,8 +144,8 @@ struct 🤖{
     transformer::T
     lm_head::L
 
-    ϵ_λ::E
-    x₀_λ::X
+    λᵦ::E
+    λx₀::X
 
     smear_gate::S
     smear_lambda::SL
@@ -306,8 +306,8 @@ function parameter_layout(
     # Per-layer learned scalars
     # -------------------------------------------------------------------------
 
-    ϵ_λ = take(config.n_layer)
-    x₀_λ = take(config.n_layer)
+    λᵦ = take(config.n_layer)
+    λx₀ = take(config.n_layer)
 
 
     # -------------------------------------------------------------------------
@@ -344,8 +344,8 @@ function parameter_layout(
 
         lm_head = lm_head,
 
-        ϵ_λ = ϵ_λ,
-        x₀_λ = x₀_λ,
+        λᵦ = λᵦ,
+        λx₀ = λx₀,
 
         smear_gate = smear_gate,
         smear_lambda = smear_lambda,
@@ -395,7 +395,7 @@ function Block(
         Linear(Θ, 🧠.ℙ),
     )
 
-    Block(attention, mlp)
+    Block(attention, mlp, Embedding(θ, config))
 end
 
 function Transformer(
@@ -428,8 +428,8 @@ function rotary_embeddings(
     base::AbstractFloat = 100_000f0,
 ) where {A<:AbstractArray}
 
-    channel_range = A{Float32}(undef, head_dim ÷ 2)
-    t = A{Float32}(undef, seq_len)
+    channel_range = A(undef, head_dim ÷ 2)
+    t = A(undef, seq_len)
 
     # Mathematically these start at zero
     # We'll set up basic ranges and subtract 1 from them to get the correct values
@@ -472,14 +472,14 @@ function 🤖(
         layout.lm_head,
     )
 
-    ϵ_λ = paramview(
+    λᵦ = paramview(
         Θ,
-        layout.ϵ_λ,
+        layout.λᵦ,
     )
 
-    x₀_λ = paramview(
+    λx₀ = paramview(
         Θ,
-        layout.x₀_λ,
+        layout.λx₀,
     )
 
     smear_gate = Linear(
@@ -504,7 +504,7 @@ function 🤖(
 
     rope_sin_cos = rotary_embeddings(
         typeof(Θ),
-        config.sequence_len,
+        10 * config.sequence_len,
         config.n_embed ÷ config.n_head,
     )
 
@@ -516,8 +516,8 @@ function 🤖(
         transformer,
         lm_head,
 
-        ϵ_λ,
-        x₀_λ,
+        λᵦ,
+        λx₀,
 
         smear_gate,
         smear_lambda,

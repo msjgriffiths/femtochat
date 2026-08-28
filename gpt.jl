@@ -1,6 +1,7 @@
 
 module GPT
 using ..Parameters
+using ..Kernels
 
 function sigmoid(x)
     @. 1 / (1 + exp(-x))
@@ -80,14 +81,15 @@ function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Unio
     rope_sin, rope_cos = sin_cos
     Q = apply_rotary_embedding(Q, rope_cos, rope_sin)
     K = apply_rotary_embedding(K, rope_cos, rope_sin)
-    Q = norm(Q) .* 1.2
-    K = norm(K) .* 1.2
+    Q = norm(Q) .* 1.2f0
+    K = norm(K) .* 1.2f0
 
     y = attention(Q, K, V, window)
+    y = reshape(y, C, T, B)
     ℙ(y)
 end
 
-function (𝔹::Block)(x::AbstractMatrix, ve::Union{Nothing,AbstractMatrix} = nothing, sin_cos::Union{Nothing,Tuple{AbstractMatrix,AbstractMatrix}} = nothing)
+function (𝔹::Block)(x::AbstractArray, ve::Union{Nothing,AbstractArray} = nothing, sin_cos::Union{Nothing,Tuple{AbstractMatrix,AbstractMatrix}} = nothing)
     x .+= 𝔹.👀(norm(x), sin_cos, ve) # Residual highway
     x .+= 𝔹.🧠(norm(x)) # Residual highway
 end
@@ -95,12 +97,35 @@ end
 function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     x = ω.transformer.embed(tokens)
     sin_cos = ω.rope_sin_cos
+    x = norm(x)
 
+    # TODO: Smear
+
+    x₀ = x
+
+    x_backout = nothing
+    backout_layer = ω.config.n_layer ÷ 2
     for (i, block) in enumerate(ω.transformer.blocks)
+        x = λᵦ * x + λx₀ * x₀ # X is linear interpolation between the original x and the current x
+        # Get value embedding matrix from this block given tokens
+         ve = isnothing(ω.𝕧𝕖) ? nothing : block.🍰(tokens)
         x = block(x, ve, sin_cos)
+        if i == backout_layer
+            x_backout = x
+        end
     end
 
-    ω.lm_head(x)
+    if !isnothing(x_backout)
+        # Subtract mid-layer residual to remove low-level features before logit projection
+        x -= ω.backout_lambda * x_backout
+    end
+
+    x = norm(x)
+
+    softcap = 15f0
+    logits = ω.lm_head(x)
+    @. logits = softcap * tanh(logits / softcap)
+
 end
 
 end
