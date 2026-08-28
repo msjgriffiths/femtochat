@@ -13,6 +13,7 @@ function norm(x, ϵ=1f-6)
     D = size(x, 1) # Since we're column orientated, first dimension is token embedding size
     x ./ sqrt.(Σ(abs2, x; dims=1) ./ D .+ ϵ )
 end
+ ∥(x) = norm(x)
 
 function (ℓ::Linear)(x::AbstractArray)
     Din = size(x, 1)
@@ -112,7 +113,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     for (i, block) in enumerate(ω.transformer.blocks)
         x = λᵦ[i] * x + λx₀[i] * x₀ # X is linear interpolation between the original x and the current x
         # Get value embedding matrix from this block given tokens
-         ve = isnothing(ω.𝕧𝕖) ? nothing : block.🍰(tokens)
+         ve = isnothing(ω.value_embeds[i]) ? nothing : block.🍰(tokens)
         x = block(x, ve, sin_cos)
         if i == backout_layer
             x_backout = x
@@ -130,6 +131,11 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     logits = ω.lm_head(x)
     @. logits = softcap * tanh(logits / softcap)
     logits
+end
+
+function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractVector)
+    logits = ω(tokens)
+    # TODO: Apply cross entropy here
 end
 
 end

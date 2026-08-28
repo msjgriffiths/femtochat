@@ -133,7 +133,6 @@ struct 🤖{
     S<:Linear,
     SL<:AbstractVector{<:ParamFloat},
     BL<:AbstractVector{<:ParamFloat},
-    V<:AbstractVector{<:Embedding},
     R<:Tuple{AbstractMatrix{<:AbstractFloat}, AbstractMatrix{<:AbstractFloat}},
 }
     config::GPTConfig
@@ -148,10 +147,8 @@ struct 🤖{
     λx₀::X
 
     smear_gate::S
-    smear_lambda::SL
-    λᵧ::BL
-
-    value_embeds::V
+    λₛ::SL # smear lambda
+    λᵧ::BL # Backout lambda
 
     rotary_seq_len::Int
     rope_sin_cos::R
@@ -205,15 +202,6 @@ end
 
 """
 Generate the complete mapping from GPT parameters into one flat vector.
-
-Matrix convention:
-
-    Linear:     (output, input)
-    Embedding:  (embedding, vocabulary)
-
-This makes the embedding dimension contiguous within each token column
-and corresponds naturally to `W * X` with activations arranged as
-features × tokens.
 
 All parameters belonging to an individual transformer block are
 contiguous in memory.
@@ -285,6 +273,10 @@ function parameter_layout(
                 # MLP projection: 4d → d
                 ℙ = take(d, 4d),
             ),
+
+            🍰 = (
+                𝔼 = has_ve(layer_idx, config.n_layer) ? take(d, padded_vocab_size) : nothing,
+            )
         )
         for layer_idx in 1:config.n_layer
     ]
@@ -317,22 +309,8 @@ function parameter_layout(
     # Smear gate: first 24 embedding channels → one scalar gate
     smear_gate = take(1, 24)
 
-    smear_lambda = take(1)
+    λₛ = take(1)
     λᵧ = take(1)
-
-
-    # -------------------------------------------------------------------------
-    # Value embeddings
-    # -------------------------------------------------------------------------
-
-    value_embeds = [
-        (
-            layer_idx = layer_idx,
-            𝔼 = take(kv_dim, padded_vocab_size),
-        )
-        for layer_idx in 1:config.n_layer
-        if has_ve(layer_idx, config.n_layer)
-    ]
 
 
     # -------------------------------------------------------------------------
@@ -348,10 +326,8 @@ function parameter_layout(
         λx₀ = λx₀,
 
         smear_gate = smear_gate,
-        smear_lambda = smear_lambda,
+        λₛ = λₛ,
         λᵧ = λᵧ,
-
-        value_embeds = value_embeds,
 
         padded_vocab_size = padded_vocab_size,
         nparams = i - 1,
@@ -487,9 +463,9 @@ function 🤖(
         layout.smear_gate,
     )
 
-    smear_lambda = paramview(
+    λₛ = paramview(
         Θ,
-        layout.smear_lambda,
+        layout.λₛ,
     )
 
     λᵧ = paramview(
@@ -520,7 +496,7 @@ function 🤖(
         λx₀,
 
         smear_gate,
-        smear_lambda,
+        λₛ,
         λᵧ,
 
         value_embeds,
