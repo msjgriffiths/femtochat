@@ -101,7 +101,7 @@ end
 
 function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     (; λᵧ, λₛ) = ω
-    (; n_layer, vocab_size = ω.config)
+    (; n_layer, vocab_size) = ω.config
     x = ω.transformer.embed(tokens)
     x = norm(x)
 
