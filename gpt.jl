@@ -128,7 +128,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     softcap = 15f0
     logits = ω.lm_head(x)
     @. logits = softcap * tanh(logits / softcap)
-
+    logits
 end
 
 end
