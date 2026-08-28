@@ -103,13 +103,12 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     (; λᵧ, λₛ) = ω
     (; n_layer, vocab_size = ω.config)
     x = ω.transformer.embed(tokens)
-    sin_cos = ω.rope_sin_cos
     x = norm(x)
 
-    # TODO: Smear
-    gate = @. λₛ * σ(ω.smear_gate(x[1:24, 2:end, :]))
-    xₛ = copy(x) # Create a copy to read from to avoid race condition updating values
-    @views x[:, 2:end, :] .+=  gate .* xₛ[:, 1:end-1, :]
+    # Smear token embeddings together for cheap bigram information
+    gate = λₛ .* σ(ω.smear_gate(@view x[1:24, 2:end, :]))
+    xₛ = copy(@view x[:, 1:end-1, :]) # Create a copy to read from to avoid race condition updating values
+    @views x[:, 2:end, :] .+=  gate .* xₛ
 
     x₀ = x
 
@@ -122,7 +121,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
         # We pull out embedding matrix here because we have tokens here, instead of 
         # passing token indexes down. 
         ve = isnothing(🍰) ? nothing : 🍰(tokens)
-        x = block(x, ve, sin_cos)
+        x = block(x, ve, ω.rope_sin_cos)
         if i == backout_layer
             x_backout = x
         end
@@ -146,8 +145,50 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::Abstr
     # TODO: Apply cross entropy here
 end
 
-function initialize!(θ, layout)
+function uniform!(ℛ, Θ::AbstractVector, spec::ParamSpec, low, high)
+    paramview(Θ, spec) .=
+        low .+ (high - low) .* rand(ℛ, Float32, spec.shape)
 
+    return nothing
+end
+
+function initialize!(ℛ, params::Params, layout)
+    (; θ) = params
+    (; blocks, embedding) = layout.transformer
+    (; lm_head, smear_gate, λₛ, λᵧ) = layout
+    
+    D = embedding.shape[1]
+    n_layer = length(blocks)
+    s = √(3f0 / D) # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+
+    paramview(θ, embedding) .= .8f0 .* randn(ℛ, Float32, embedding.shape)
+    paramview(θ, lm_head) .= 0.001f0 .* randn(ℛ, Float32, layout.lm_head.shape)
+    for (i, block) in blocks
+        (; 👀, 🍰, λᵦ, λx₀) = block
+        (; 𝕎, 𝕂, 𝕍, ℙ, 𝕧𝕖) = 👀
+        uniform!(ℛ, θ, 𝕎, -s, s)
+        uniform!(ℛ, θ, 𝕂, -s, s)
+        uniform!(ℛ, θ, 𝕍, -s, s)
+        paramview(θ, ℙ) .= 0f0 # Projection starts at zero
+        
+        # Value embedding and its gate exist on alternating layers.
+        if !isnothing(🍰.𝔼)
+            uniform!(ℛ, θ, 🍰.𝔼, -s, s)
+            uniform!(ℛ, θ, 𝕧𝕖, 0f0, 0.02f0)
+        end
+
+        (; 𝔽, ℙ) = blocks.🧠
+        uniform!(ℛ, θ, 𝔽, -.4s, .4s)
+        paramview(θ, ℙ) .= 0f0 # Projection starts at zero
+
+        depth = Float32(i - 1) / max(n_layer - 1, 1)
+        paramview(θ, λᵦ) .= 1.15f0 - 0.10f0depth
+        paramview(θ, λx₀) .=  0.20f0 - 0.15f0depth
+    end
+    # Backout lambda + smear lamda/gate
+    paramview(θ, λᵧ) .= 0.2f0
+    paramview(θ, λₛ) .= 0f0
+    uniform!(ℛ, θ, smear_gate, 0f0, 0.02f0)
 end
 
 end
