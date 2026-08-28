@@ -71,7 +71,7 @@ Configuration parameters for GPT model. These are used to determine how
     n_head::Int = 6
     n_kv_head::Int = 6
     n_embed::Int = 768
-    window_pattern::String = "SSL"
+    window_pattern::String = "SSSL"
 end
 
 struct Linear{
