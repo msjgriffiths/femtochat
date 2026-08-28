@@ -113,7 +113,7 @@ Attention is 👀 since it looks at everything, and 🧠 is a callback to old Pe
 struct Block 
     👀::CausalSelfAttention
     🧠::MLP
-    🍰::Embedding
+    🍰::Union{Nothing,Embedding}
 end
 
 struct Transformer{
@@ -275,7 +275,7 @@ function parameter_layout(
             ),
 
             🍰 = (
-                𝔼 = has_ve(layer_idx, config.n_layer) ? take(d, padded_vocab_size) : nothing,
+                𝔼 = has_ve(layer_idx, config.n_layer) ? take(kv_dim, padded_vocab_size) : nothing,
             )
         )
         for layer_idx in 1:config.n_layer
@@ -371,7 +371,11 @@ function Block(
         Linear(Θ, 🧠.ℙ),
     )
 
-    Block(attention, mlp, Embedding(θ, config))
+    🍰 = isnothing(layout.🍰.𝔼) ?
+        nothing :
+        Embedding(Θ, layout.🍰.𝔼)
+
+    Block(attention, mlp, 🍰)
 end
 
 function Transformer(
@@ -473,11 +477,6 @@ function 🤖(
         layout.λᵧ,
     )
 
-    value_embeds = [
-        Embedding(Θ, ve.𝔼)
-        for ve in layout.value_embeds
-    ]
-
     rope_sin_cos = rotary_embeddings(
         typeof(Θ),
         10 * config.sequence_len,
@@ -498,8 +497,6 @@ function 🤖(
         smear_gate,
         λₛ,
         λᵧ,
-
-        value_embeds,
 
         10config.sequence_len,
         rope_sin_cos
