@@ -152,8 +152,8 @@ function uniform!(ℛ, Θ::AbstractVector, spec::ParamSpec, low, high)
     return nothing
 end
 
-function initialize!(ℛ, params::Params, layout)
-    (; θ) = params
+function initialize!(params::Params, layout, ℛ = 42)
+    (; Θ) = params
     (; blocks, embedding) = layout.transformer
     (; lm_head, smear_gate, λₛ, λᵧ) = layout
     
@@ -161,34 +161,34 @@ function initialize!(ℛ, params::Params, layout)
     n_layer = length(blocks)
     s = √(3f0 / D) # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
 
-    paramview(θ, embedding) .= .8f0 .* randn(ℛ, Float32, embedding.shape)
-    paramview(θ, lm_head) .= 0.001f0 .* randn(ℛ, Float32, layout.lm_head.shape)
+    paramview(Θ, embedding) .= .8f0 .* randn(ℛ, Float32, embedding.shape)
+    paramview(Θ, lm_head) .= 0.001f0 .* randn(ℛ, Float32, layout.lm_head.shape)
     for (i, block) in blocks
         (; 👀, 🍰, λᵦ, λx₀) = block
         (; 𝕎, 𝕂, 𝕍, ℙ, 𝕧𝕖) = 👀
-        uniform!(ℛ, θ, 𝕎, -s, s)
-        uniform!(ℛ, θ, 𝕂, -s, s)
-        uniform!(ℛ, θ, 𝕍, -s, s)
-        paramview(θ, ℙ) .= 0f0 # Projection starts at zero
+        uniform!(ℛ, Θ, 𝕎, -s, s)
+        uniform!(ℛ, Θ, 𝕂, -s, s)
+        uniform!(ℛ, Θ, 𝕍, -s, s)
+        paramview(Θ, ℙ) .= 0f0 # Projection starts at zero
         
         # Value embedding and its gate exist on alternating layers.
         if !isnothing(🍰.𝔼)
-            uniform!(ℛ, θ, 🍰.𝔼, -s, s)
-            uniform!(ℛ, θ, 𝕧𝕖, 0f0, 0.02f0)
+            uniform!(ℛ, Θ, 🍰.𝔼, -s, s)
+            uniform!(ℛ, Θ, 𝕧𝕖, 0f0, 0.02f0)
         end
 
         (; 𝔽, ℙ) = blocks.🧠
-        uniform!(ℛ, θ, 𝔽, -.4s, .4s)
-        paramview(θ, ℙ) .= 0f0 # Projection starts at zero
+        uniform!(ℛ, Θ, 𝔽, -.4s, .4s)
+        paramview(Θ, ℙ) .= 0f0 # Projection starts at zero
 
         depth = Float32(i - 1) / max(n_layer - 1, 1)
-        paramview(θ, λᵦ) .= 1.15f0 - 0.10f0depth
-        paramview(θ, λx₀) .=  0.20f0 - 0.15f0depth
+        paramview(Θ, λᵦ) .= 1.15f0 - 0.10f0depth
+        paramview(Θ, λx₀) .=  0.20f0 - 0.15f0depth
     end
     # Backout lambda + smear lamda/gate
-    paramview(θ, λᵧ) .= 0.2f0
-    paramview(θ, λₛ) .= 0f0
-    uniform!(ℛ, θ, smear_gate, 0f0, 0.02f0)
+    paramview(Θ, λᵧ) .= 0.2f0
+    paramview(Θ, λₛ) .= 0f0
+    uniform!(ℛ, Θ, smear_gate, 0f0, 0.02f0)
 end
 
 end
