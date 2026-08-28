@@ -154,7 +154,7 @@ function cross_entropy(logits, targets; ignore_index=-1)
     losses = vec(logsumexp(logits[:, valid])) .-
              logits[CartesianIndex.(targets[valid], valid)]
 
-    mean(losses)
+    sum(losses) / length(losses)
 end
 
 function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray{<:Integer})
