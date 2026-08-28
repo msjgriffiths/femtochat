@@ -177,7 +177,7 @@ function initialize!(params::Params, layout, ℛ = 42)
             uniform!(ℛ, Θ, 𝕧𝕖, 0f0, 0.02f0)
         end
 
-        (; 𝔽, ℙ) = blocks.🧠
+        (; 𝔽, ℙ) = block.🧠
         uniform!(ℛ, Θ, 𝔽, -.4s, .4s)
         paramview(Θ, ℙ) .= 0f0 # Projection starts at zero
 
