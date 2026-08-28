@@ -25,16 +25,19 @@ end
 function attention(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::AbstractArray{F,4}, window) where F
     D, H, T, B = size(Q)
     mask = attention_mask(T, window)
+    n_kv_head = size(K, 2)
+    heads_per_kv = H ÷ n_kv_head
     
     # Output to store result in
     # key × query × head × batch
     S = Array{F}(undef, T, T, H, B)
     for document in 1:B, head in 1:H
+        kv_head = cld(head, heads_per_kv)
         # For each document in document
         # For each head in H
         @views mul!(
             S[:, :, head, document], # Place the result in S, one for each head and document
-            K[:, head, :, document]', # Transpose K for the dot product
+            K[:, kv_head, :, document]', # Transpose K for the dot product
             Q[:, head, :, document] # Q for the dot product
         )
     end
@@ -45,11 +48,12 @@ function attention(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::AbstractArra
 
     Y = similar(Q) # Create output matrix same shape as Q
     for document in 1:B, head in 1:H
+        kv_head = cld(head, heads_per_kv)
         # For each document in document
         # For each head in H
         @views mul!(
             Y[:, head, :, document], # Place the result in Y, one for each head and document
-            V[:, head, :, document], # Value matrix is D x head x token x document
+            V[:, kv_head, :, document], # Value matrix is D x head x token x document
             S[:, :, head, document] # S is token x token x head x document
         )
     end
