@@ -433,8 +433,8 @@ function rotary_embeddings(
 
     # Mathematically these start at zero
     # We'll set up basic ranges and subtract 1 from them to get the correct values
-    channel_range .= 1:2:head_dim .- 1
-    t .= 1:seq_len .- 1
+    channel_range .= (1:2:head_dim) .- 1
+    t .= (1:seq_len) .- 1
 
     inv_freq = @. 1f0 / base^(channel_range / head_dim)
     freqs = inv_freq * t'
