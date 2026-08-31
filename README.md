@@ -23,25 +23,41 @@ Using Julia allows some of the benefits of Python (strong REPL, interactive expe
 
 ## Example
 
+### Tokenizer
+
 ```julia
-Enzyme.API.strictAliasing!(false)
-Enzyme.API.looseTypeAnalysis!(true)
+include("tokenizers.jl")
+
+tokenizer = BPETokenizer()
+train!(tokenizer, 2^11,  "data/")
+
+@info tokenizer("this is a test")
+# [ Info: UInt16[0x0182, 0x0113, 0x0133, 0x0102, 0x046a]
+
+@info tokenizer(UInt16[0x0182, 0x0113, 0x0133, 0x0102, 0x046a])
+# [ Info: this is a test
+```
+
+### Model Loss
+
+```julia
+include("femtochat.jl")
+using .FemtoChat
 
 # Tiny model
-config = GPTConfig(sequence_len = 4, vocab_size = 8, n_layer = 1, n_head = 4, n_kv_head = 2, n_embed = 24,window_pattern = "L",)
+config = GPTConfig(sequence_len = 4, vocab_size = 8, n_layer = 1, n_head = 4, n_kv_head = 2, n_embed = 24, window_pattern = "L",)
 
 # Map layers onto parameter vector
 layout = parameter_layout(config)
 
 # params.Θ contains weights; params.δ receives gradients.
 params = Params(Vector{Float32}(undef, layout.nparams))
-GPT.initialize!(params, layout, MersenneTwister(123))
+initialize!(params, layout, MersenneTwister(123))
 
-{; Θ, δ} = params
+(; Θ, δ) = params
 model = 🤖(Θ, config, layout)
 shadow = 🤖(δ, config, layout)
 
-fill!(δ, 0f0) # Clear gradients
 foreach(buffer -> fill!(buffer, 0f0), shadow.rope_sin_cos) # Initialize shadow RoPE
 
 tokens = Int[1:4 2:5]
@@ -49,20 +65,24 @@ targets = Int[2:5 3:6]
 
 ℒ₀ = model(tokens, targets)
 
-# Compute ∂loss/∂Θ, accumulating it into params.δ.
+fill!(δ, 0f0) # Clear gradients
+
+Enzyme.API.strictAliasing!(false)
+Enzyme.API.looseTypeAnalysis!(true)
 Enzyme.autodiff(
     Enzyme.Reverse,
     (m, x, y) -> m(x, y),
     Enzyme.Active,
-    Enzyme.Duplicated(model, shadow),  
+    Enzyme.Duplicated(model, shadow), 
     Enzyme.Const(tokens),
     Enzyme.Const(targets),
 )
 
 # One plain SGD step.
-learning_rate = 0.01f0
-Θ .-= learning_rate .* δ
+μ = 0.01f0
+Θ .-= μ .* δ
 
 ℒ₁ = model(tokens, targets)
 
 ```
+
