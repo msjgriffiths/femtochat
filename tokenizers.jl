@@ -1,5 +1,7 @@
 module Tokenizer
 
+export BPETokenizer, train!
+
 using DuckDB: DB, StreamResult, nextDataChunk
 using DBInterface: connect, execute
 using DataStructures: BinaryMaxHeap
@@ -48,6 +50,89 @@ struct BPETokenizer
     vocab::Vector{Vector{UInt8}}
     merges::Dict{Pair,Token}
 end
+
+function merge_tokens!(ids::Vector{Token}, p::Pair, new_token::Token)
+    a = left(p)
+    b = right(p)
+
+    write = 1
+    read = 1
+
+    @inbounds while read <= length(ids)
+        if read < length(ids) && ids[read] == a && ids[read + 1] == b
+            ids[write] = new_token
+            read += 2
+        else
+            ids[write] = ids[read]
+            read += 1
+        end
+
+        write += 1
+    end
+
+    resize!(ids, write - 1)
+    return ids
+end
+
+function encode_piece(T::BPETokenizer, piece::AbstractString)
+    ids = Token[
+        Token(byte) + one(Token)
+        for byte in codeunits(piece)
+    ]
+
+    while length(ids) > 1
+        best_pair = zero(Pair)
+        best_token = zero(Token)
+
+        @inbounds for i in 1:length(ids)-1
+            p = pair(ids[i], ids[i + 1])
+            token = get(T.merges, p, zero(Token))
+
+            if token != 0 && (best_token == 0 || token < best_token)
+                best_pair = p
+                best_token = token
+            end
+        end
+
+        best_token == 0 && break
+        merge_tokens!(ids, best_pair, best_token)
+    end
+
+    return ids
+end
+
+
+function encode(T::BPETokenizer, text::AbstractString)
+    tokens = Token[]
+
+    for M in eachmatch(SPLIT_PATTERN, text)
+        append!(tokens, encode_piece(T, M.match))
+    end
+
+    return tokens
+end
+
+
+function decode(T::BPETokenizer, tokens)
+    bytes = UInt8[]
+
+    for token in tokens
+        append!(bytes, T.vocab[Int(token)])
+    end
+
+    return String(bytes)
+end
+
+
+(T::BPETokenizer)(text::AbstractString) = encode(T, text)
+
+(T::BPETokenizer)(texts::AbstractVector{<:AbstractString}) =
+    map(text -> encode(T, text), texts)
+
+(T::BPETokenizer)(tokens::AbstractVector{Token}) = decode(T, tokens)
+
+(T::BPETokenizer)(tokens::AbstractMatrix{Token}) =
+    map(column -> decode(T, column), eachcol(tokens))
 
 function count_partition!(counts, texts, partition, partition_count)
     for i in partition:partition_count:length(texts)
