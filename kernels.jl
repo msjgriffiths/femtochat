@@ -1,7 +1,7 @@
 module Kernels
 
 using LinearAlgebra: mul!, UpperTriangular
-using CUDA: CuMatrix
+# using CUDA: CuMatrix
 
 export attention, softmax!
 
@@ -61,8 +61,8 @@ function attention(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::AbstractArra
     Y
 end
 
-function attention(Q::CuMatrix, K::CuMatrix, V::CuMatrix, window)
-    # TODO: FA2 or FA3
-end
+# function attention(Q::CuMatrix, K::CuMatrix, V::CuMatrix, window)
+#     # TODO: FA2 or FA3
+# end
 
 end
