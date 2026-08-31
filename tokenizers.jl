@@ -4,7 +4,6 @@ export BPETokenizer, train!
 
 using DuckDB: DB, StreamResult, nextDataChunk
 using DBInterface: connect, execute
-using DataStructures: BinaryMaxHeap
 using Tables
 
 const SPECIAL_TOKENS = (
@@ -39,6 +38,49 @@ end
 
 Base.isless(a::MergeJob, b::MergeJob) =
     a.count == b.count ? a.pair > b.pair : a.count < b.count
+
+function heap_push!(heap::Vector{T}, value::T) where T
+    push!(heap, value)
+    child = length(heap)
+
+    while child > 1
+        parent = child ÷ 2
+        isless(heap[parent], heap[child]) || break
+
+        heap[parent], heap[child] = heap[child], heap[parent]
+        child = parent
+    end
+
+    return heap
+end
+
+function heap_pop!(heap::Vector{T}) where T
+    isempty(heap) && throw(ArgumentError("heap is empty"))
+
+    top = heap[1]
+    last = pop!(heap)
+    isempty(heap) && return top
+
+    heap[1] = last
+    parent = 1
+
+    while true
+        left = 2parent
+        left > length(heap) && break
+
+        right = left + 1
+        child =
+            right <= length(heap) && isless(heap[left], heap[right]) ?
+            right : left
+
+        isless(heap[parent], heap[child]) || break
+
+        heap[parent], heap[child] = heap[child], heap[parent]
+        parent = child
+    end
+
+    return top
+end
 
 @inline pair(a::Token, b::Token)::Pair =
     (Pair(a) << 16) | Pair(b)
@@ -259,9 +301,9 @@ function train!(T::BPETokenizer, target_vocab_size, directory::String)
         end
     end
 
-    heap = BinaryMaxHeap{MergeJob}()
+    heap = MergeJob[]
     for (p, positions) in pair_values
-        push!(heap, MergeJob(p, pair_counts[p], positions))
+        heap_push!(heap, MergeJob(p, pair_counts[p], positions))
     end
     empty!(pair_values)
 
@@ -272,7 +314,7 @@ function train!(T::BPETokenizer, target_vocab_size, directory::String)
     while length(T.vocab) < mergeable_vocab_size
         isempty(heap) && break
 
-        job = pop!(heap)
+        job = heap_pop!(heap)
         best_pair = job.pair
         best_count = get(pair_counts, best_pair, UInt64(0))
 
@@ -280,7 +322,7 @@ function train!(T::BPETokenizer, target_vocab_size, directory::String)
 
         if job.count != best_count
             job.count = best_count
-            push!(heap, job)
+            heap_push!(heap, job)
             continue
         end
 
@@ -334,7 +376,7 @@ function train!(T::BPETokenizer, target_vocab_size, directory::String)
 
         for (p, positions) in new_positions
             count = get(pair_counts, p, UInt64(0))
-            count > 0 && push!(heap, MergeJob(p, count, positions))
+            count > 0 && heap_push!(heap, MergeJob(p, count, positions))
         end
 
         merges_done += 1
