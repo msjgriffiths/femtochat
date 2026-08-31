@@ -42,6 +42,8 @@ train!(tokenizer, 2^11,  "data/")
 
 ```julia
 include("femtochat.jl")
+using Random
+using Enzyme
 using .FemtoChat
 
 # Tiny model
@@ -83,6 +85,5 @@ Enzyme.autodiff(
 Θ .-= μ .* δ
 
 ℒ₁ = model(tokens, targets)
-
 ```
 
