@@ -7,7 +7,7 @@ using DBInterface: connect, execute
 using DataStructures: BinaryMaxHeap
 using Tables
 
-SPECIAL_TOKENS = [
+const SPECIAL_TOKENS = (
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
     "<|bos|>",
     # tokens below are only used during finetuning to render Conversations into token ids
@@ -19,9 +19,9 @@ SPECIAL_TOKENS = [
     "<|python_end|>",
     "<|output_start|>", # python REPL outputs back to assistant
     "<|output_end|>",
-]
+)
 
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+const SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 const Token = UInt16
 const Pair  = UInt32
@@ -192,6 +192,9 @@ function merge_pair!(value::Value, p::Pair, new_token::Token)
 end
 
 function train!(T::BPETokenizer, target_vocab_size, directory::String)
+    mergeable_vocab_size = target_vocab_size - length(SPECIAL_TOKENS)
+    @assert mergeable_vocab_size >= 256
+
     con = connect(DB, ":memory:")
     result = execute(
         con,
@@ -262,11 +265,11 @@ function train!(T::BPETokenizer, target_vocab_size, directory::String)
     end
     empty!(pair_values)
 
-    merges_to_do = max(target_vocab_size - length(T.vocab), 0)
+    merges_to_do = max(mergeable_vocab_size - length(T.vocab), 0)
     merges_done = 0
     last_percent = 0
 
-    while length(T.vocab) < target_vocab_size
+    while length(T.vocab) < mergeable_vocab_size
         isempty(heap) && break
 
         job = pop!(heap)
@@ -342,6 +345,11 @@ function train!(T::BPETokenizer, target_vocab_size, directory::String)
             last_percent = percent
         end
     end
+
+    append!(
+        T.vocab,
+        [collect(codeunits(token)) for token in SPECIAL_TOKENS],
+    )
 
     return nothing
 end
