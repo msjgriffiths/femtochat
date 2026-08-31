@@ -51,6 +51,11 @@ struct BPETokenizer
     merges::Dict{Pair,Token}
 end
 
+BPETokenizer() = BPETokenizer(
+    [UInt8[byte] for byte in 0x00:0xff],
+    Dict{Pair,Token}(),
+)
+
 function merge_tokens!(ids::Vector{Token}, p::Pair, new_token::Token)
     a = left(p)
     b = right(p)
@@ -249,11 +254,6 @@ function train!(T::BPETokenizer, target_vocab_size, directory::String)
                 )
             end
         end
-    end
-
-    if isempty(T.vocab)
-        sizehint!(T.vocab, typemax(Token))
-        append!(T.vocab, [UInt8[b] for b in 0x00:0xff])
     end
 
     heap = BinaryMaxHeap{MergeJob}()
