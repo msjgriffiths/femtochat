@@ -1,8 +1,9 @@
 module DataLoading
 
-using DuckDB: StreamResult
-using DBInterface: execute
+using DuckDB: DB, StreamResult
+using DBInterface: connect, execute
 using Tables: rows
+using ..Dataset: MAX_SHARD
 using ..Tokenizer: bos_token_id
 
 export DataLoader,
@@ -26,11 +27,12 @@ end
 
 DataLoaderState() = DataLoaderState(1, 1, 1)
 
-mutable struct DataLoader
+mutable struct DataLoader{C}
     files::Vector{String}
     rank::Int
     world_size::Int
     state::DataLoaderState
+    connection::C
 end
 
 function DataLoader(
@@ -38,6 +40,7 @@ function DataLoader(
     rank::Int = 0,
     world_size::Int = 1,
     state::DataLoaderState = DataLoaderState(),
+    connection = connect(DB, ":memory:"),
 )
     world_size > 0 || throw(ArgumentError("world_size must be positive"))
     0 <= rank < world_size ||
@@ -52,7 +55,20 @@ function DataLoader(
     state.row > 0 || throw(ArgumentError("state.row must be positive"))
     state.epoch > 0 || throw(ArgumentError("state.epoch must be positive"))
 
-    DataLoader(files, rank, world_size, state)
+    DataLoader(files, rank, world_size, state, connection)
+end
+
+function DataLoader(directory::AbstractString, split::Symbol; kwargs...)
+    split in (:train, :test) ||
+        throw(ArgumentError("split must be :train or :test"))
+
+    test_shard = "shard_$(lpad(MAX_SHARD, 5, '0')).parquet"
+    files = filter(readdir(directory; join=true)) do path
+        endswith(path, ".parquet") &&
+            (split == :test) == (basename(path) == test_shard)
+    end
+
+    DataLoader(files; kwargs...)
 end
 
 current_file(loader::DataLoader) = loader.files[loader.state.file]
@@ -63,12 +79,12 @@ Stream documents from the loader's current file, starting at its saved row.
 The result contains `text` and the zero-based Parquet `file_row_number`.
 This function does not advance `loader.state`.
 """
-function read_documents(loader::DataLoader, connection)
+function read_documents(loader::DataLoader)
     file = replace(current_file(loader), "'" => "''")
     row = loader.state.row - 1
 
     execute(
-        connection,
+        loader.connection,
         """
         SELECT text, file_row_number
         FROM read_parquet('$file', file_row_number=true)
@@ -89,16 +105,15 @@ function tokenize_documents(tokenizer, texts)
     end
 end
 
-struct DocumentIterator{L,C,T,I}
+struct DocumentIterator{L,T,I}
     loader::L
-    connection::C
     tokenizer::T
     bos::I
 end
 
 """Iterate forever over tokenized, BOS-prefixed documents."""
-eachdocument(loader::DataLoader, connection, tokenizer) =
-    DocumentIterator(loader, connection, tokenizer, bos_token_id(tokenizer))
+eachdocument(loader::DataLoader, tokenizer) =
+    DocumentIterator(loader, tokenizer, bos_token_id(tokenizer))
 
 function model_batch(documents, sequence_len, bos)
     batch_size = length(documents)
@@ -117,12 +132,12 @@ function model_batch(documents, sequence_len, bos)
 end
 
 """Iterate forever over model-ready batches of `k` documents."""
-function eachbatch(loader::DataLoader, connection, tokenizer, k::Int, sequence_len::Int)
+function eachbatch(loader::DataLoader, tokenizer, k::Int, sequence_len::Int)
     k > 0 || throw(ArgumentError("batch size must be positive"))
     sequence_len > 0 || throw(ArgumentError("sequence length must be positive"))
 
     bos = bos_token_id(tokenizer)
-    documents = eachdocument(loader, connection, tokenizer)
+    documents = eachdocument(loader, tokenizer)
     batches = Iterators.partition(documents, k)
 
     (model_batch(batch, sequence_len, bos) for batch in batches)
@@ -143,7 +158,7 @@ end
 function next_document(documents::DocumentIterator, document_rows, result)
     while isnothing(result)
         next_file!(documents.loader)
-        document_rows = rows(read_documents(documents.loader, documents.connection))
+        document_rows = rows(read_documents(documents.loader))
         result = iterate(document_rows)
     end
 
@@ -159,7 +174,7 @@ function next_document(documents::DocumentIterator, document_rows, result)
 end
 
 function Base.iterate(documents::DocumentIterator)
-    document_rows = rows(read_documents(documents.loader, documents.connection))
+    document_rows = rows(read_documents(documents.loader))
     next_document(documents, document_rows, iterate(document_rows))
 end
 
