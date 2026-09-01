@@ -1,10 +1,11 @@
 module Tokenizer
 
-export BPETokenizer, train!
+export BPETokenizer, train!, save, load
 
 using DuckDB: DB, StreamResult, nextDataChunk
 using DBInterface: connect, execute
 using Tables
+using Serialization: serialize, deserialize
 
 const SPECIAL_TOKENS = (
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
@@ -396,5 +397,13 @@ function train!(T::BPETokenizer, target_vocab_size, directory::String)
     return nothing
 end
 
+save(T::BPETokenizer, path::String) =
+    open(path, "w") do io
+        serialize(io, T)
+    end
 
+load!(T::BPETokenizer, path::String) =
+    open(path, "r") do io
+        T = deserialize(io)
+    end
 end
