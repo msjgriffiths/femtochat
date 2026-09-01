@@ -1,6 +1,6 @@
 module Tokenizer
 
-export BPETokenizer, train!, save, load
+export BPETokenizer, train!, save, load, bos_token_id
 
 using DuckDB: DB, StreamResult, nextDataChunk
 using DBInterface: connect, execute
@@ -98,6 +98,16 @@ BPETokenizer() = BPETokenizer(
     [UInt8[byte] for byte in 0x00:0xff],
     Dict{Pair,Token}(),
 )
+
+function bos_token_id(T::BPETokenizer)
+    id = length(T.vocab) - length(SPECIAL_TOKENS) + 1
+    bos = collect(codeunits(first(SPECIAL_TOKENS)))
+
+    id > 0 && T.vocab[id] == bos ||
+        throw(ArgumentError("tokenizer does not contain the BOS token"))
+
+    return Token(id)
+end
 
 function merge_tokens!(ids::Vector{Token}, p::Pair, new_token::Token)
     a = left(p)
