@@ -42,32 +42,29 @@ train!(tokenizer, 2^11,  "data/")
 
 ```julia
 include("femtochat.jl")
-using Random
-using Enzyme
-using .FemtoChat
 
-# Tiny model
+using .FemtoChat
+using Enzyme
+using Random
+
 config = GPTConfig(sequence_len = 4, vocab_size = 8, n_layer = 1, n_head = 4, n_kv_head = 2, n_embed = 24, window_pattern = "L",)
 
-# Map layers onto parameter vector
 layout = parameter_layout(config)
-
-# params.Θ contains weights; params.δ receives gradients.
 params = Params(Vector{Float32}(undef, layout.nparams))
-initialize!(params, layout, MersenneTwister(123))
+ℛ = MersenneTwister(42)
+initialize!(params, layout, ℛ)
 
 (; Θ, δ) = params
-model = 🤖(Θ, config, layout)
-shadow = 🤖(δ, config, layout)
+ℳ = 🤖(params, config, layout)
+👤 = 🤖(δ, config, layout) # Shadow of model structure for Enzyme
 
-foreach(buffer -> fill!(buffer, 0f0), shadow.rope_sin_cos) # Initialize shadow RoPE
+fill!(δ, 0f0)
+foreach(buffer -> fill!(buffer, 0f0), 👤.rope_sin_cos)
 
 tokens = Int[1:4 2:5]
 targets = Int[2:5 3:6]
 
-ℒ₀ = model(tokens, targets)
-
-fill!(δ, 0f0) # Clear gradients
+ℒ₀ = ℳ(tokens, targets)
 
 Enzyme.API.strictAliasing!(false)
 Enzyme.API.looseTypeAnalysis!(true)
@@ -75,15 +72,15 @@ Enzyme.autodiff(
     Enzyme.Reverse,
     (m, x, y) -> m(x, y),
     Enzyme.Active,
-    Enzyme.Duplicated(model, shadow), 
+    Enzyme.Duplicated(ℳ, 👤),
     Enzyme.Const(tokens),
     Enzyme.Const(targets),
 )
 
-# One plain SGD step.
-μ = 0.01f0
-Θ .-= μ .* δ
-
+Θ .-= 0.01f0 .* δ
 ℒ₁ = model(tokens, targets)
+
+(; ℒ₀, ℒ₁)
+@assert ℒ₀ > ℒ₁
 ```
 
