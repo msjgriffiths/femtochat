@@ -1,6 +1,6 @@
 module Optimizer
 
-using LinearAlgebra: norm
+using LinearAlgebra: norm, mul!
 
 mutable struct AdamW{F<:AbstractFloat,V<:AbstractVector}
     α::F
@@ -75,28 +75,40 @@ end
 struct Muon
 end
 
-function zeropower(G; steps=10, ϵ=1f-7)
-    @assert ndims(G) == 2
+# From nanochat code, we get (a, b, c) for each step
+const ρₜ = (
+    (8.156554524902461f0,  -22.48329292557795f0,  15.878769915207462f0),
+    (4.042929935166739f0,   -2.808917465908714f0,  0.5000178451051316f0),
+    (3.8916678022926607f0,  -2.772484153217685f0,  0.5060648178503393f0),
+    (3.285753657755655f0,   -2.3681294933425376f0,  0.46449024233003106f0),
+    (2.3465413258596377f0,  -1.7097828382687081f0,  0.42323551169305323f0),
+)
 
-    a, b, c = 3.4445f0, -4.7750f0, 2.0315f0
+"""
+Apply ρₜ(σ) = aₜσ + bₜσ³ + cₜσ⁵ to the singular values of `G`,
+using the smaller Gram matrix for efficiency.
+"""
+function polar_express(G::AbstractMatrix; steps::Int=5)
+    @assert 1 ≤ steps ≤ length(ρₜ)
 
-    X = G ./ (norm(G) + ϵ)
+    transposed = size(G, 1) > size(G, 2)
+    scale = 1.01f0 * norm(G) + 1f-6
+    X = transposed ? G' ./ scale : G ./ scale
 
-    for _ in 1:steps
-        if size(X, 1) > size(X, 2)
-            # Tall matrix: form the smaller X'X matrix.
-            A = X' * X
-            B = b * A + c * A * A
-            X = a * X + X * B
-        else
-            # Wide matrix: form the smaller XX' matrix.
-            A = X * X'
-            B = b * A + c * A * A
-            X = a * X + B * X
-        end
+    A = similar(X, size(X, 1), size(X, 1))
+    B, Y = similar(A), similar(X)
+
+    for t in 1:steps
+        a, b, c = ρₜ[t]
+
+        mul!(A, X, X')       # A = XX'
+        mul!(B, A, A)        # B = A²
+        @. B = b * A + c * B
+        mul!(Y, B, X)
+        @. X = a * X + Y
     end
 
-    return X
+    return transposed ? X' : X
 end
 
 
