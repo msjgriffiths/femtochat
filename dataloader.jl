@@ -100,10 +100,32 @@ end
 eachdocument(loader::DataLoader, connection, tokenizer) =
     DocumentIterator(loader, connection, tokenizer, bos_token_id(tokenizer))
 
-"""Iterate forever over batches of `k` tokenized documents."""
-function eachbatch(loader::DataLoader, connection, tokenizer, k::Int)
+function model_batch(documents, sequence_len, bos)
+    batch_size = length(documents)
+    tokens = fill(Int(bos), sequence_len, batch_size)
+    targets = fill(-1, sequence_len, batch_size)
+
+    for (batch, document) in enumerate(documents)
+        n = min(sequence_len, length(document) - 1)
+        n == 0 && continue
+
+        @views tokens[1:n, batch] .= document[1:n]
+        @views targets[1:n, batch] .= document[2:n+1]
+    end
+
+    return tokens, targets
+end
+
+"""Iterate forever over model-ready batches of `k` documents."""
+function eachbatch(loader::DataLoader, connection, tokenizer, k::Int, sequence_len::Int)
     k > 0 || throw(ArgumentError("batch size must be positive"))
-    Iterators.partition(eachdocument(loader, connection, tokenizer), k)
+    sequence_len > 0 || throw(ArgumentError("sequence length must be positive"))
+
+    bos = bos_token_id(tokenizer)
+    documents = eachdocument(loader, connection, tokenizer)
+    batches = Iterators.partition(documents, k)
+
+    (model_batch(batch, sequence_len, bos) for batch in batches)
 end
 
 Base.IteratorSize(::Type{<:DocumentIterator}) = Base.IsInfinite()
