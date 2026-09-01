@@ -241,7 +241,7 @@ function train!(T::BPETokenizer, target_vocab_size, directory::String)
     con = connect(DB, ":memory:")
     result = execute(
         con,
-        "SELECT text FROM read_parquet('$(directory)')",
+        "SELECT text FROM read_parquet('$(directory)') where filename not like '%6542%'",
         StreamResult,
     );
     thread_count = Threads.nthreads()
@@ -402,8 +402,9 @@ save(T::BPETokenizer, path::String) =
         serialize(io, T)
     end
 
-load!(T::BPETokenizer, path::String) =
+load(::Type{BPETokenizer}, path::String) =
     open(path, "r") do io
-        T = deserialize(io)
+        deserialize(io)::BPETokenizer
     end
+
 end
