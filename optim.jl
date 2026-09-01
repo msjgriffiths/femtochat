@@ -1,6 +1,9 @@
 module Optimizer
 
 using LinearAlgebra: norm, mul!
+using ..Parameters: Params, ParamSpec, paramview
+
+export AdamW, Muon, MuonAdamW, polar_express
 
 mutable struct AdamW{F<:AbstractFloat,V<:AbstractVector}
     α::F
@@ -184,6 +187,148 @@ function (ω::Muon)(θ, gₜ)
     η = α * √max(1f0, Float32(m) / Float32(n))
     @. θ -= η * X + η * λ * θ * ((X * θ) ≥ 0)
 
+    return nothing
+end
+
+struct ParameterUpdate{O,P,G}
+    ω::O
+    θ::P
+    δ::G
+end
+
+(update::ParameterUpdate)() = update.ω(update.θ, update.δ)
+
+function adamw_update(params::Params, spec; kwargs...)
+    θ = vec(paramview(params.Θ, spec))
+    δ = vec(paramview(params.δ, spec))
+    ParameterUpdate(AdamW(θ; kwargs...), θ, δ)
+end
+
+function muon_update(params::Params, spec::ParamSpec{2}; kwargs...)
+    θ = paramview(params.Θ, spec)
+    δ = paramview(params.δ, spec)
+    ParameterUpdate(Muon(δ; kwargs...), θ, δ)
+end
+
+struct MuonAdamW{A,M}
+    adamw::A
+    muon::M
+end
+
+"""
+Build nanochat's optimizer groups as zero-copy views into `params`.
+
+Transformer-block matrices use Muon. Embeddings, the language-model head,
+residual scalars, and smear parameters use their corresponding AdamW settings.
+"""
+function MuonAdamW(
+    params::Params,
+    layout;
+    unembedding_lr=0.004f0,
+    embedding_lr=0.2f0,
+    matrix_lr=0.02f0,
+    weight_decay=0f0,
+    scalar_lr=0.5f0,
+)
+    D = layout.transformer.embedding.shape[1]
+    scale = √(768f0 / D)
+
+    adamw = [adamw_update(
+        params,
+        layout.lm_head;
+        α=Float32(unembedding_lr) * scale,
+        β₁=0.8f0,
+        β₂=0.96f0,
+        ϵ=1f-10,
+        λ=0.01f0,
+    )]
+
+    push!(adamw, adamw_update(
+        params,
+        layout.transformer.embedding;
+        α=Float32(embedding_lr) * scale,
+        β₁=0.8f0,
+        β₂=0.995f0,
+        ϵ=1f-10,
+        λ=0.001f0,
+    ))
+
+    for block in layout.transformer.blocks
+        if !isnothing(block.🍰.𝔼)
+            push!(adamw, adamw_update(
+                params,
+                block.🍰.𝔼;
+                α=0.5f0 * Float32(embedding_lr) * scale,
+                β₁=0.8f0,
+                β₂=0.995f0,
+                ϵ=1f-10,
+                λ=0.01f0,
+            ))
+        end
+
+        push!(adamw, adamw_update(
+            params,
+            block.λᵦ;
+            α=0.01f0 * Float32(scalar_lr),
+            β₁=0.8f0,
+            β₂=0.95f0,
+            ϵ=1f-10,
+            λ=0.05f0,
+        ))
+
+        push!(adamw, adamw_update(
+            params,
+            block.λx₀;
+            α=Float32(scalar_lr),
+            β₁=0.96f0,
+            β₂=0.95f0,
+            ϵ=1f-10,
+            λ=0f0,
+        ))
+    end
+
+    for spec in (layout.smear_gate, layout.λₛ, layout.λᵧ)
+        push!(adamw, adamw_update(
+            params,
+            spec;
+            α=0.2f0,
+            β₁=0.8f0,
+            β₂=0.95f0,
+            ϵ=1f-10,
+            λ=0f0,
+        ))
+    end
+
+    muon_specs = ParamSpec{2}[]
+    for block in layout.transformer.blocks
+        (; 👀, 🧠) = block
+        append!(muon_specs, (👀.𝕎, 👀.𝕂, 👀.𝕍, 👀.ℙ, 🧠.𝔽, 🧠.ℙ))
+        isnothing(👀.𝕧𝕖) || push!(muon_specs, 👀.𝕧𝕖)
+    end
+
+    muon = [
+        muon_update(
+            params,
+            spec;
+            α=Float32(matrix_lr),
+            μ=0.95f0,
+            β₂=0.9f0,
+            λ=Float32(weight_decay),
+            steps=5,
+        )
+        for spec in muon_specs
+    ]
+
+    return MuonAdamW(adamw, muon)
+end
+
+function (ω::MuonAdamW)()
+    for update in ω.adamw
+        update()
+    end
+    for update in ω.muon
+        update()
+    end
     return nothing
 end
 
