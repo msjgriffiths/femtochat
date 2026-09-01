@@ -72,9 +72,6 @@ function (ω::AdamW)(θ, gₜ)
     return nothing
 end
 
-struct Muon
-end
-
 # From nanochat code, we get (a, b, c) for each step
 const ρₜ = (
     (8.156554524902461f0,  -22.48329292557795f0,  15.878769915207462f0),
@@ -87,6 +84,18 @@ const ρₜ = (
 """
 Apply ρₜ(σ) = aₜσ + bₜσ³ + cₜσ⁵ to the singular values of `G`,
 using the smaller Gram matrix for efficiency.
+def PolarExpress(G:torch.Tensor,steps:int)->torch.Tensor:
+    X = G.bfloat16() #forspeed
+    i fG.size(-2) > G.size(-1): X=X.mT # thisreducesFLOPs
+    X = X / (X.norm(dim=(-2,-1),keepdim=True) * 1.01+1e-7)
+    hs = coeffs_list[:steps] +list(
+         repeat(coeffs_list[-1],steps-len(coeffs_list)))
+    for a,b,c in hs:
+        A = X @ X.mT
+        B = b * A+c * A @ A
+        X = a * X+B @ X # X<-aX+bXˆ3+cXˆ5
+    ifG.size(-2)>G.size(-1):X=X.mT
+    return X
 """
 function polar_express(G::AbstractMatrix; steps::Int=5)
     @assert 1 ≤ steps ≤ length(ρₜ)
@@ -109,6 +118,72 @@ function polar_express(G::AbstractMatrix; steps::Int=5)
     end
 
     return transposed ? X' : X
+end
+
+mutable struct Muon{F<:AbstractFloat,M<:AbstractMatrix}
+    α::F
+    μ::F
+    β₂::F
+    λ::F
+    steps::Int
+    𝓂ₜ::M
+    𝓋ₜ::M
+end
+
+function Muon(
+    θ::AbstractMatrix;
+    α=0.02f0,
+    μ=0.95f0,
+    β₂=0.9f0,
+    λ=0.01f0,
+    steps=5,
+)
+    m, n = size(θ)
+
+    𝓂ₜ = similar(θ)
+    𝓋ₜ = similar(θ, m ≥ n ? (m, 1) : (1, n))
+    fill!(𝓂ₜ, 0f0)
+    fill!(𝓋ₜ, 0f0)
+
+    return Muon(α, μ, β₂, λ, steps, 𝓂ₜ, 𝓋ₜ)
+end
+
+function (ω::Muon)(θ, gₜ)
+    (; α, μ, β₂, λ, steps, 𝓂ₜ, 𝓋ₜ) = ω
+    m, n = size(θ)
+
+    # Nesterov momentum
+    @. 𝓂ₜ = μ * 𝓂ₜ + (1f0 - μ) * gₜ
+    X = @. (1f0 - μ) * gₜ + μ * 𝓂ₜ
+
+    # MuonEq row equilibration
+    target = norm(X) / √Float32(m)
+    row_norm = sqrt.(sum(abs2, X; dims=2))
+    @. X *= target / max(row_norm, 1f-6)
+
+    # Polar Express
+    X = polar_express(X; steps)
+
+    # Muon+ renormalization
+    X .*= √Float32(min(m, n)) / max(norm(X), 1f-6)
+
+    # NorMuon variance reduction
+    dimension = m ≥ n ? 2 : 1
+    dimension_size = size(X, dimension)
+    v_mean = sum(abs2, X; dims=dimension) ./ dimension_size
+
+    @. 𝓋ₜ = β₂ * 𝓋ₜ + (1f0 - β₂) * v_mean
+    step_size = @. inv(√max(𝓋ₜ, 1f-10))
+
+    old_norm = norm(X)
+    new_norm = √sum(dimension_size .* v_mean .* step_size.^2)
+    @. X *= step_size * old_norm / max(new_norm, 1f-10)
+
+    # Shape-adjusted learning rate and cautious decay
+    η = α * √max(1f0, Float32(m) / Float32(n))
+    @. θ -= η * X + η * λ * θ * ((X * θ) ≥ 0)
+
+    return nothing
 end
 
 
