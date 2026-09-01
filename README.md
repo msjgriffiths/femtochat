@@ -137,13 +137,13 @@ function ∇ℒ!(ℳ, 👤, tokens, targets)
 end
 
 η = 0.01f0
-for (step, (tokens, targets)) in enumerate(take(batches, 10))
+for (kₛ, (x̄, ȳ)) in enumerate(take(batches, 10))
     fill!(δ, 0f0) # We could alias this to zero_grad!
 
-    ℒₛ = ∇ℒ!(ℳ, 👤, tokens, targets) # Loss on this step
+    ℒₛ = ∇ℒ!(ℳ, 👤, x̄, ȳ) # Loss on this step
 
     Θ .-= η .* δ # Update model parameters with small step in gradient direction
 
-    @info (; step, ℒₛ)
+    @info (; kₛ, ℒₛ)
 end
 ```
