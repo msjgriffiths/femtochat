@@ -64,13 +64,14 @@ foreach(buffer -> fill!(buffer, 0f0), 👤.rope_sin_cos)
 tokens = Int[1:4 2:5]
 targets = Int[2:5 3:6]
 
-ℒ₀ = ℳ(tokens, targets)
+ℒ(model, tokens, targets) = model(tokens, targets)
 
 Enzyme.API.strictAliasing!(false)
 Enzyme.API.looseTypeAnalysis!(true)
-Enzyme.autodiff(
-    Enzyme.Reverse,
-    (m, x, y) -> m(x, y),
+
+_, ℒ₀ = Enzyme.autodiff(
+    Enzyme.ReverseWithPrimal,
+    ℒ,
     Enzyme.Active,
     Enzyme.Duplicated(ℳ, 👤),
     Enzyme.Const(tokens),
@@ -78,9 +79,71 @@ Enzyme.autodiff(
 )
 
 Θ .-= 0.01f0 .* δ
-ℒ₁ = ℳ(tokens, targets)
+ℒ₁ = ℒ(ℳ, tokens, targets)
 
 @info (; ℒ₀, ℒ₁)
 @assert ℒ₀ > ℒ₁
 ```
 
+### Dataset Loading
+
+This standalone example follows nanochat's small CPU configuration: four
+layers, a sequence length of 512, one document per device batch, and ten
+training steps. Thus each step contains 512 tokens.
+
+```julia
+include("femtochat.jl")
+
+using .FemtoChat
+using Enzyme
+using Random
+using Iterators: take
+Enzyme.API.strictAliasing!(false)
+Enzyme.API.looseTypeAnalysis!(true)
+
+directory = joinpath("data", "climbmix-400b-shuffle")
+tokenizer = BPETokenizer()
+train!(tokenizer, 2^9, joinpath(directory, "shard_00000.parquet"),)
+
+config = GPTConfig(sequence_len = 512, vocab_size = length(tokenizer.vocab), n_layer = 4,n_head = 2,n_kv_head = 2,n_embed = 256,window_pattern = "SSSL",)
+
+layout = parameter_layout(config)
+params = Params(Vector{Float32}(undef, layout.nparams))
+ℛ = MersenneTwister(42)
+initialize!(params, layout, ℛ)
+
+(; Θ, δ) = params
+ℳ = 🤖(params, config, layout)
+👤 = 🤖(δ, config, layout) # Shadow of model structure for Enzyme
+foreach(buffer -> fill!(buffer, 0f0), 👤.rope_sin_cos) # Initialize and ignore
+
+loader = DataLoader(directory, :train)
+batches = eachbatch(loader, tokenizer, 1, config.sequence_len,)
+
+# Define function that we are autodiffing
+ℒ(model, tokens, targets) = model(tokens, targets)
+
+# Function to invoke Enzyme to compute loss and accumulate gradients
+function ∇ℒ!(ℳ, 👤, tokens, targets)
+    _, ℓ = Enzyme.autodiff(
+        Enzyme.ReverseWithPrimal,
+        ℒ,
+        Enzyme.Active,
+        Enzyme.Duplicated(ℳ, 👤),
+        Enzyme.Const(tokens),
+        Enzyme.Const(targets),
+    )
+    return ℓ
+end
+
+η = 0.01f0
+for (step, (tokens, targets)) in enumerate(take(batches, 10))
+    fill!(δ, 0f0) # We could alias this to zero_grad!
+
+    ℒₛ = ∇ℒ!(ℳ, 👤, tokens, targets) # Loss on this step
+
+    Θ .-= η .* δ # Update model parameters with small step in gradient direction
+
+    @info (; step, ℒₛ)
+end
+```
