@@ -78,9 +78,9 @@ Enzyme.autodiff(
 )
 
 Θ .-= 0.01f0 .* δ
-ℒ₁ = model(tokens, targets)
+ℒ₁ = ℳ(tokens, targets)
 
-(; ℒ₀, ℒ₁)
+@info (; ℒ₀, ℒ₁)
 @assert ℒ₀ > ℒ₁
 ```
 
