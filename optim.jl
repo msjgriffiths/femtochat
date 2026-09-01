@@ -1,5 +1,7 @@
 module Optimizer
 
+using LinearAlgebra: norm
+
 mutable struct AdamW{F<:AbstractFloat,V<:AbstractVector}
     α::F
     β₁::F
@@ -69,5 +71,33 @@ function (ω::AdamW)(θ, gₜ)
                (√(𝓋ₜ / (1f0 - β₂^ω.t)) + ϵ)
     return nothing
 end
+
+struct Muon
+end
+
+function zeropower(G; steps=10, ϵ=1f-7)
+    @assert ndims(G) == 2
+
+    a, b, c = 3.4445f0, -4.7750f0, 2.0315f0
+
+    X = G ./ (norm(G) + ϵ)
+
+    for _ in 1:steps
+        if size(X, 1) > size(X, 2)
+            # Tall matrix: form the smaller X'X matrix.
+            A = X' * X
+            B = b * A + c * A * A
+            X = a * X + X * B
+        else
+            # Wide matrix: form the smaller XX' matrix.
+            A = X * X'
+            B = b * A + c * A * A
+            X = a * X + B * X
+        end
+    end
+
+    return X
+end
+
 
 end
