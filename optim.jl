@@ -82,6 +82,7 @@ const ρₜ = (
 )
 
 """
+Source: https://arxiv.org/abs/2505.16932
 Apply ρₜ(σ) = aₜσ + bₜσ³ + cₜσ⁵ to the singular values of `G`,
 using the smaller Gram matrix for efficiency.
 def PolarExpress(G:torch.Tensor,steps:int)->torch.Tensor:
