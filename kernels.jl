@@ -1,18 +1,22 @@
 module Kernels
 
-using LinearAlgebra: mul!, UpperTriangular
-# using CUDA: CuMatrix
+using LinearAlgebra: mul!
 
 export attention, softmax!
 
-function attention_mask(T, window)
+function attention_mask(X, T, window)
     left, right = window
+    mask = similar(X, Bool, T, T)
+    key = reshape(1:T, T, 1)
+    query = reshape(1:T, 1, T)
 
     if window == (-1, 0)
-        Matrix(UpperTriangular(trues(T, T)))
+        @. mask = key <= query
     else
-        [q - left <= k <= q + right for k in 1:T, q in 1:T]
+        @. mask = (query - left <= key) & (key <= query + right)
     end
+
+    return mask
 end
 
 function softmax!(X; dims=1)
@@ -24,13 +28,13 @@ end
 
 function attention(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::AbstractArray{F,4}, window) where F
     D, H, T, B = size(Q)
-    mask = attention_mask(T, window)
+    mask = attention_mask(Q, T, window)
     n_kv_head = size(K, 2)
     heads_per_kv = H ÷ n_kv_head
     
     # Output to store result in
     # key × query × head × batch
-    S = Array{F}(undef, T, T, H, B)
+    S = similar(Q, T, T, H, B)
     for document in 1:B, head in 1:H
         kv_head = cld(head, heads_per_kv)
         # For each document in document
@@ -41,9 +45,9 @@ function attention(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::AbstractArra
             Q[:, head, :, document] # Q for the dot product
         )
     end
-    S = S ./ sqrt(D) # Scale by sqrt of dimension
+    S ./= sqrt(F(D)) # Scale by sqrt of dimension
 
-    S .= ifelse.(mask, S, -Inf) # Apply mask
+    S .= ifelse.(mask, S, typemin(F)) # Apply mask
     softmax!(S; dims=1) # Softmax along the key dimension
 
     Y = similar(Q) # Create output matrix same shape as Q
