@@ -10,7 +10,7 @@ Enzyme.Duplicated(params::Params) =
     Enzyme.Duplicated(params.Θ, params.δ)
 
 loss(Θ, config, layout, tokens, targets) =
-    🤖(Θ, config, layout)(tokens, targets)
+    sum(🤖(Θ, config, layout)(tokens, targets))
 
 """
 Compute the loss and accumulate its gradient directly into `params.δ`.
