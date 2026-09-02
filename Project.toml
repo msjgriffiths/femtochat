@@ -18,7 +18,6 @@ Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 Mooncake = "da2b9cff-9c12-43a0-ae48-6db2b0edb7d6"
 
 [extensions]
-FemtoChatCUDAExt = ["CUDA", "Enzyme"]
 FemtoChatEnzymeExt = "Enzyme"
 FemtoChatMooncakeExt = ["CUDA", "Mooncake"]
 
