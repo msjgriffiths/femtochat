@@ -1,7 +1,7 @@
 module Loss
 
 using ..GPT: cross_entropy
-using Iterators: take
+using Base.Iterators: take
 
 export evaluate_bpb
 
