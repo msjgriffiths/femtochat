@@ -1,9 +1,13 @@
 module Optimizer
 
-using LinearAlgebra: norm, mul!
+using LinearAlgebra: mul!
 using ..Parameters: Params, ParamSpec, paramview
 
 export AdamW, Muon, MuonAdamW, polar_express
+
+# Keep reductions on the same backend as the matrix. In particular, a 1×1
+# CuArray avoids synchronizing a scalar through the CPU inside an optimizer step.
+frobenius(X) = sqrt.(sum(abs2, X; dims=(1, 2)))
 
 mutable struct AdamW{F<:AbstractFloat,V<:AbstractVector}
     α::F
@@ -105,7 +109,7 @@ function polar_express(G::AbstractMatrix; steps::Int=5)
     @assert 1 ≤ steps ≤ length(ρₜ)
 
     transposed = size(G, 1) > size(G, 2)
-    scale = 1.01f0 * norm(G) + 1f-6
+    scale = 1.01f0 .* frobenius(G) .+ 1f-6
     X = transposed ? G' ./ scale : G ./ scale
 
     A = similar(X, size(X, 1), size(X, 1))
@@ -161,7 +165,7 @@ function (ω::Muon)(θ, gₜ)
     X = @. (1f0 - μ) * gₜ + μ * 𝓂ₜ
 
     # MuonEq row equilibration
-    target = norm(X) / √Float32(m)
+    target = frobenius(X) ./ √Float32(m)
     row_norm = sqrt.(sum(abs2, X; dims=2))
     @. X *= target / max(row_norm, 1f-6)
 
@@ -169,7 +173,7 @@ function (ω::Muon)(θ, gₜ)
     X = polar_express(X; steps)
 
     # Muon+ renormalization
-    X .*= √Float32(min(m, n)) / max(norm(X), 1f-6)
+    X .*= √Float32(min(m, n)) ./ max.(frobenius(X), 1f-6)
 
     # NorMuon variance reduction
     dimension = m ≥ n ? 2 : 1
@@ -179,8 +183,11 @@ function (ω::Muon)(θ, gₜ)
     @. 𝓋ₜ = β₂ * 𝓋ₜ + (1f0 - β₂) * v_mean
     step_size = @. inv(√max(𝓋ₜ, 1f-10))
 
-    old_norm = norm(X)
-    new_norm = √sum(dimension_size .* v_mean .* step_size.^2)
+    old_norm = frobenius(X)
+    new_norm = sqrt.(sum(
+        dimension_size .* v_mean .* step_size.^2;
+        dims=(1, 2),
+    ))
     @. X *= step_size * old_norm / max(new_norm, 1f-10)
 
     # Shape-adjusted learning rate and cautious decay
@@ -229,6 +236,7 @@ function MuonAdamW(
     matrix_lr=0.02f0,
     weight_decay=0f0,
     scalar_lr=0.5f0,
+    smear_lr=0.2f0,
 )
     D = layout.transformer.embedding.shape[1]
     scale = √(768f0 / D)
@@ -291,7 +299,7 @@ function MuonAdamW(
         push!(adamw, adamw_update(
             params,
             spec;
-            α=0.2f0,
+            α=Float32(smear_lr),
             β₁=0.8f0,
             β₂=0.95f0,
             ϵ=1f-10,
