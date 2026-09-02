@@ -6,36 +6,11 @@ I picked the name `femtochat` because (a) `femto` means small (`nano` is `10^-9`
 
 The main dependencies are:
 
-  * [Enzyme](https://github.com/EnzymeAD) for auto-differentiation. Enzyme (like tapanade) is a compiler-level autodiff engine, which supports custom rules (e.g. Flash Attention reverse)
+  * [Enzyme](https://github.com/EnzymeAD) for auto-differentiation. Enzyme (like tapanade) is a compiler-level autodiff engine, which supports custom rules (e.g. Flash Attention reverse) as well as other languages like Rust.
+  * [Mooncake](https://github.com/chalk-lab/Mooncake.jl) as an alternative autodiff backend because my 5-year old Dell laptop I'm prototyping this on uses an ancient `GTX
+1050` that supports CUDA 11.1. Enzyme fails compilation. This requires quite a lot of additional backwards rules (which I've had Codex write). 
   * [DuckDB](https://duckdb.org/) for handling Parquet files. 
   * [CUDA.jl](https://cuda.juliagpu.org/stable/) for running on GPUs.
-
-### Environments
-
-The Dell laptop uses a CUDA.jl release compatible with its older NVIDIA
-driver, while development machines use the newest compatible CUDA 6 release.
-Both environments use the same local FemtoChat package:
-
-```sh
-# Dell laptop: CUDA.jl 5.8.5
-julia --project=environments/dell
-
-# Development/production GPU: latest locked CUDA.jl 6.x
-julia --project=environments/dev
-```
-
-Run `using Pkg; Pkg.instantiate()` once after selecting an environment. The
-committed manifest then reproduces the exact versions tested for that target.
-
-The Dell-compatible, full-device reference backward can be run with:
-
-```sh
-julia --project=environments/dell scripts/gpu_reference_train.jl
-```
-
-It uses direct CUDA.jl plus Enzyme's deferred device differentiation—no
-KernelAbstractions. It intentionally runs the complete model in one GPU thread
-as a correctness reference; it is not the eventual high-throughput backend.
 
 We do steal a the `BinaryMaxHeap` data structure from [DataStructures.jl](https://juliacollections.github.io/DataStructures.jl/latest/) (+ inline it into codebase) because importing the full dependency for one 30-line implementation feels like a lot. In a "real" (non-toy) codebase we'd import the full dependency for flexibility. [DataStructures.jl](https://juliacollections.github.io/DataStructures.jl/latest/) is a great package.
 
@@ -123,15 +98,7 @@ _, ℒ₀ = Enzyme.autodiff(
 @assert ℒ₀ > ℒ₁
 ```
 
-`loss_and_gradient!(params, config, layout, tokens, targets)` packages this
-same block for use in a training loop. The first new model shape incurs Enzyme
-compilation; subsequent calls reuse the compiled reverse pass.
-
 ### Dataset Loading
-
-This standalone example follows nanochat's small CPU configuration: four
-layers, a sequence length of 512, one document per device batch, and ten
-training steps. Thus each step contains 512 tokens.
 
 ```julia
 using FemtoChat
@@ -163,36 +130,4 @@ for (kₛ, (x̄, ȳ)) in enumerate(take(batches, 10))
 
     @info (; kₛ, ℒₛ)
 end
-```
-
-### Dell GPU training
-
-The Dell environment pins CUDA and Mooncake versions compatible with its GTX
-1050. The training script reads shards `00000` through `00010`, logs metrics and
-model artifacts to Weights & Biases using the credentials saved by `wandb
-login`, and writes one local weight checkpoint after each shard.
-
-```powershell
-julia environments/dell/setup.jl
-julia --project=environments/dell scripts/train_dell_gpu.jl
-```
-
-Set `FEMTOCHAT_WANDB=false` to train without W&B. Model dimensions, batch size,
-and an optional step limit can be changed with the `FEMTOCHAT_N_LAYER`,
-`FEMTOCHAT_N_EMBED`, `FEMTOCHAT_SEQUENCE_LEN`, `FEMTOCHAT_BATCH_SIZE`, and
-`FEMTOCHAT_MAX_STEPS` environment variables.
-
-Checkpoints contain the model configuration, training counters, completed
-shard, and a CPU copy of the flat weight vector `Θ`. They intentionally omit
-optimizer state.
-
-```julia
-using CUDA
-using FemtoChat
-using Serialization: deserialize
-
-checkpoint = open(deserialize, "checkpoints/<run>/shard_00010.jls")
-layout = parameter_layout(checkpoint.config)
-params = Params(CuArray(checkpoint.Θ))
-model = 🤖(params, checkpoint.config, layout)
 ```
