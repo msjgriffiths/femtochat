@@ -247,7 +247,7 @@ Source: https://arxiv.org/abs/2205.14135
 15:        On chip, compute 𝐏ᵢⱼᵈʳᵒᵖᵖᵉᵈ = 𝐏ᵢⱼ ∘ 𝐙ᵢⱼ
            (pointwise multiply).
 16:        On chip, compute d𝐕̃ⱼ ← d𝐕̃ⱼ + (𝐏ᵢⱼᵈʳᵒᵖᵖᵉᵈ)ᵀd𝐎ᵢ ∈ ℝᴮᶜˣᵈ.
-17:        On chip, compute d𝐏ᵢⱼᵈʳᵒᵖᵖᵉᵈ = d𝐎ᵢd𝐕̃ⱼᵀ ∈ ℝᴮʳˣᴮᶜ.
+17:        On chip, compute d𝐏ᵢⱼᵈʳᵒᵖᵖᵉᵈ = d𝐎ᵢ𝐕ⱼᵀ ∈ ℝᴮʳˣᴮᶜ.
 18:        On chip, compute d𝐏ᵢⱼ = d𝐏ᵢⱼᵈʳᵒᵖᵖᵉᵈ ∘ 𝐙ᵢⱼ
            (pointwise multiply).
 19:        On chip, compute 𝐃ᵢ = rowsum(d𝐎ᵢ ∘ 𝐎ᵢ) ∈ ℝᴮʳ.
@@ -260,8 +260,98 @@ Source: https://arxiv.org/abs/2205.14135
 26: Return d𝐐, d𝐊, d𝐕.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
-function Δflash_attention₁()
+function Δflash_attention₁!(
+    dQ::AbstractArray{F,4},
+    dK::AbstractArray{F,4},
+    dV::AbstractArray{F,4},
+    dO::AbstractArray{F,4},
+    Q::AbstractArray{F,4},
+    K::AbstractArray{F,4},
+    V::AbstractArray{F,4},
+    O::AbstractArray{F,4},
+    ℓ::AbstractArray{F,4},
+    m::AbstractArray{F,4},
+    window::Tuple{Int,Int},
+) where {F<:AbstractFloat}
+    D, H, T, B = size(Q)
+    Bᶜ, Bᵣ = min(T, 512), min(T, 512)
 
+    n_kv_head = size(K, 2)
+    heads_per_kv = H ÷ n_kv_head
+
+    Tᵣ, Tᶜ = cld(T, Bᵣ), cld(T, Bᶜ)
+    scale = inv(sqrt(F(D)))
+    masked = -floatmax(F)
+
+    S = similar(Q, Bᶜ, Bᵣ)
+    M = similar(Q, Bool, Bᶜ, Bᵣ)
+    dP = similar(Q, Bᶜ, Bᵣ)
+    dS = similar(Q, Bᶜ, Bᵣ)
+    Dᵢ = similar(Q, 1, Bᵣ)
+    dOO = similar(Q, D, Bᵣ)
+
+    for document in 1:B, head in 1:H
+        kv_head = cld(head, heads_per_kv)
+
+        for j in 1:Tᶜ
+            blockⱼ = (j - 1) * Bᶜ + 1:min(j * Bᶜ, T)
+            Kⱼ = @view K[:, kv_head, blockⱼ, document]
+            Vⱼ = @view V[:, kv_head, blockⱼ, document]
+            dKⱼ = @view dK[:, kv_head, blockⱼ, document]
+            dVⱼ = @view dV[:, kv_head, blockⱼ, document]
+
+            for i in 1:Tᵣ
+                blockᵢ = (i - 1) * Bᵣ + 1:min(i * Bᵣ, T)
+                nᵢ, nⱼ = length(blockᵢ), length(blockⱼ)
+                @views begin
+                    Qᵢ = Q[:, head, blockᵢ, document]
+                    dQᵢ = dQ[:, head, blockᵢ, document]
+                    Oᵢ = O[:, head, blockᵢ, document]
+                    dOᵢ = dO[:, head, blockᵢ, document]
+                    mᵢ = m[:, blockᵢ, head, document]
+                    ℓᵢ = ℓ[:, blockᵢ, head, document]
+                    Sᵢⱼ = S[1:nⱼ, 1:nᵢ]
+                    Mᵢⱼ = M[1:nⱼ, 1:nᵢ]
+                    dPᵢⱼ = dP[1:nⱼ, 1:nᵢ]
+                    dSᵢⱼ = dS[1:nⱼ, 1:nᵢ]
+                    Dᵢⱼ = Dᵢ[:, 1:nᵢ]
+                    dOOᵢ = dOO[:, 1:nᵢ]
+                end
+                mul!(Sᵢⱼ, Kⱼ', Qᵢ)
+                @. Sᵢⱼ *= scale
+
+                attention_mask!(Mᵢⱼ, blockⱼ, blockᵢ, window)
+                @. Sᵢⱼ = ifelse(Mᵢⱼ, Sᵢⱼ, masked)
+                @. Sᵢⱼ = ifelse(
+                    Mᵢⱼ,
+                    exp(Sᵢⱼ - mᵢ) / max(ℓᵢ, eps(F)),
+                    zero(F),
+                )
+
+                Pᵢⱼ = Sᵢⱼ
+
+                # 16: d𝐕̃ⱼ ← d𝐕̃ⱼ + 𝐏ᵢⱼᵀd𝐎ᵢ
+                mul!(dVⱼ, dOᵢ, Pᵢⱼ', one(F), one(F))
+
+                # 17: d𝐏ᵢⱼ = d𝐎ᵢ𝐕ⱼᵀ
+                mul!(dPᵢⱼ, Vⱼ', dOᵢ)
+
+                # 19: 𝐃ᵢ = rowsum(d𝐎ᵢ ∘ 𝐎ᵢ)
+                @. dOOᵢ = dOᵢ * Oᵢ
+                sum!(Dᵢⱼ, dOOᵢ)
+
+                # 20: d𝐒ᵢⱼ = 𝐏ᵢⱼ ∘ (d𝐏ᵢⱼ − 𝐃ᵢ)
+                @. dSᵢⱼ = Pᵢⱼ * (dPᵢⱼ - Dᵢⱼ)
+
+                # 21: d𝐐ᵢ ← d𝐐ᵢ + τ𝐊ⱼd𝐒ᵢⱼ
+                mul!(dQᵢ, Kⱼ, dSᵢⱼ, scale, one(F))
+
+                # 22: d𝐊̃ⱼ ← d𝐊̃ⱼ + τ𝐐ᵢd𝐒ᵢⱼᵀ
+                mul!(dKⱼ, Qᵢ, dSᵢⱼ', scale, one(F))
+            end
+        end
+    end
+    return nothing
 end
 
 
