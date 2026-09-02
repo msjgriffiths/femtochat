@@ -449,6 +449,7 @@ end
     CuArray{T,3},
     CuArray{I,2},
     Int,
+    Symbol,
 } where {T<:AbstractFloat,I<:Integer}
 
 function target_gradient_kernel!(gradient, targets, scale, vocab_size, ignore_index)
@@ -497,12 +498,16 @@ function Mooncake.rrule!!(
     logits::CoDual{<:CuArray{T,3},<:CuArray{T,3}},
     targets::CoDual{<:CuArray{I,2},NoFData},
     ignore_index::CoDual{Int,NoFData},
+    reduction::CoDual{Symbol,NoFData},
 ) where {T<:AbstractFloat,I<:Integer}
+    primal(reduction) === :mean ||
+        throw(ArgumentError("the cross-entropy pullback requires reduction=:mean"))
     primal_logits, gradient = arrayify(logits)
     result = zero_fcodual(cross_entropy(
         primal_logits,
         primal(targets),
         primal(ignore_index),
+        primal(reduction),
     ))
 
     function cross_entropy_pullback(::NoRData)
@@ -513,7 +518,7 @@ function Mooncake.rrule!!(
             tangent(result),
             primal(ignore_index),
         )
-        return NoRData(), NoRData(), NoRData(), NoRData()
+        return NoRData(), NoRData(), NoRData(), NoRData(), NoRData()
     end
 
     return result, cross_entropy_pullback
