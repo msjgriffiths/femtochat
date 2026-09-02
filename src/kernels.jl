@@ -119,10 +119,6 @@ function flash_attention₁(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::Abs
     scale = inv(sqrt(F(D)))
     masked = -floatmax(F)
 
-    𝕆 = fill!(similar(Q), zero(F))
-    ℓ = fill!(similar(Q, 1, T, H, B), zero(F))
-    m = fill!(similar(Q, 1, T, H, B), typemin(F))
-
     # Scratch space for intermediate computations
     # These are used to avoid allocating new arrays in the inner loop
     S = similar(Q, Bᶜ, Bᵣ)
@@ -142,9 +138,7 @@ function flash_attention₁(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::Abs
             for i in 1:Tᵣ
                 blockᵢ = (i - 1) * Bᵣ + 1:min(i * Bᵣ, T)
                 nᵢ, nⱼ = length(blockᵢ), length(blockⱼ)
-                # We reference the views of the matrices in the inner loop to
-                # avoid allocating new arrays for each block. 
-                # This is important for performance
+                # Views to avoid allocations
                 @views begin
                     Qᵢ = Q[:, head, blockᵢ, document]
                     𝕆ᵢ = 𝕆[:, head, blockᵢ, document]
@@ -162,10 +156,7 @@ function flash_attention₁(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::Abs
                     ℓᵢⁿᵉʷ = ℓⁿᵉʷ[:, 1:nᵢ]
                 end
 
-                # One downside of our implementation is that each
-                # mul! is a single CUDA kernel launch, which can be slower
-                # than a single fused kernel
-                # This runs on CPU and GPU though
+                # One downside of our implementation is that each mul! is a single CUDA kernel launch, so slower than fused kernel
                 mul!(Sᵢⱼ, Kⱼ', Qᵢ)
                 @. Sᵢⱼ *= scale
 
