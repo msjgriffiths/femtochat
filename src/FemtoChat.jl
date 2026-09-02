@@ -8,6 +8,8 @@ include("tokenizers.jl")
 include("dataset.jl")
 include("dataloader.jl")
 include("generation.jl")
+include("loss_eval.jl")
+include("common.jl")
 
 using .Parameters
 using .Optimizer
@@ -16,10 +18,10 @@ using .Tokenizer
 using .Dataset
 using .DataLoading
 using .Generation
+using .Loss
+using .Common
 
-function gpu_reference_loss end
-function gpu_reference_gradient! end
-function gpu_reference_state end
+
 function loss_and_gradient! end
 function gradient_state end
 
@@ -50,8 +52,7 @@ export Params,
        ℒ,
        gradient_state,
        loss_and_gradient!,
-       gpu_reference_state,
-       gpu_reference_loss,
-       gpu_reference_gradient!
+       evaluate_bpb,
+       print_banner
 
 end
