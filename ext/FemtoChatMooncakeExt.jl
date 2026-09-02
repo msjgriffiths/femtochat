@@ -12,7 +12,7 @@ import FemtoChat.GPT: apply_rotary_embedding,
                       norm,
                       smear,
                       smear_input
-import FemtoChat.Kernels: attention, attention_mask, softmax!
+import FemtoChat.Kernels: attention, flash_attention₁!, Δflash_attention₁!
 using FemtoChat.Parameters: Embedding, GPTConfig, Linear, Params, paramview, 🤖
 using Mooncake: CoDual,
                 MinimalCtx,
@@ -356,65 +356,6 @@ end
     Tuple{Int,Int},
 } where {T<:AbstractFloat}
 
-function attention_pullback!(dQ, dK, dV, dY, Q, K, V, window)
-    D, H, T, B = size(Q)
-    heads_per_kv = H ÷ size(K, 2)
-    scale = inv(sqrt(eltype(Q)(D)))
-    mask = attention_mask(Q, T, window)
-    S = similar(Q, T, T, H, B)
-    for document in 1:B, head in 1:H
-        kv_head = cld(head, heads_per_kv)
-        @views mul!(
-            S[:, :, head, document],
-            K[:, kv_head, :, document]',
-            Q[:, head, :, document],
-        )
-    end
-    S .*= scale
-    S .= ifelse.(mask, S, typemin(eltype(Q)))
-    softmax!(S; dims=1)
-    dS = similar(S)
-
-    for document in 1:B, head in 1:H
-        kv_head = cld(head, heads_per_kv)
-
-        @views mul!(
-            dV[:, kv_head, :, document],
-            dY[:, head, :, document],
-            S[:, :, head, document]',
-            one(eltype(Q)),
-            one(eltype(Q)),
-        )
-        @views mul!(
-            dS[:, :, head, document],
-            V[:, kv_head, :, document]',
-            dY[:, head, :, document],
-        )
-
-        score = @view S[:, :, head, document]
-        score_gradient = @view dS[:, :, head, document]
-        column_dot = sum(score_gradient .* score; dims=1)
-        @. score_gradient = scale * score * (score_gradient - column_dot)
-
-        @views mul!(
-            dQ[:, head, :, document],
-            K[:, kv_head, :, document],
-            score_gradient,
-            one(eltype(Q)),
-            one(eltype(Q)),
-        )
-        @views mul!(
-            dK[:, kv_head, :, document],
-            Q[:, head, :, document],
-            score_gradient',
-            one(eltype(Q)),
-            one(eltype(Q)),
-        )
-    end
-
-    return nothing
-end
-
 function Mooncake.rrule!!(
     ::CoDual{typeof(attention)},
     Q::CoDual{<:CuArray{T,4},<:CuArray{T,4}},
@@ -425,10 +366,18 @@ function Mooncake.rrule!!(
     pQ, dQ = arrayify(Q)
     pK, dK = arrayify(K)
     pV, dV = arrayify(V)
-    result = zero_fcodual(attention(pQ, pK, pV, primal(window)))
+    pwindow = primal(window)
+
+    _, H, N, B = size(pQ)
+    O = similar(pQ)
+    ℓ = similar(pQ, 1, N, H, B)
+    m = similar(pQ, 1, N, H, B)
+    flash_attention₁!(O, ℓ, m, pQ, pK, pV, pwindow)
+
+    result = zero_fcodual(O)
 
     function attention_pullback(::NoRData)
-        attention_pullback!(
+        Δflash_attention₁!(
             dQ,
             dK,
             dV,
@@ -436,7 +385,10 @@ function Mooncake.rrule!!(
             pQ,
             pK,
             pV,
-            primal(window),
+            O,
+            ℓ,
+            m,
+            pwindow,
         )
         return NoRData(), NoRData(), NoRData(), NoRData(), NoRData()
     end
