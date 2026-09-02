@@ -105,14 +105,21 @@ Source: https://arxiv.org/abs/2205.14135
 16: Return 𝐎.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
-function flash_attention₁(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::AbstractArray{F,4}, window) where F
+function flash_attention₁!(
+    𝕆::AbstractArray{F,4},
+    ℓ::AbstractArray{F,4},
+    m::AbstractArray{F,4},
+    Q::AbstractArray{F,4},
+    K::AbstractArray{F,4},
+    V::AbstractArray{F,4},
+    window,
+) where F
     D, H, T, B = size(Q)
     Bᶜ, Bᵣ = min(T, 512), min(T, 512)
 
     n_kv_head = size(K, 2)
     heads_per_kv = H ÷ n_kv_head
 
-    𝕆 = similar(Q); ℓ = similar(Q, 1, T, H, B); m = similar(Q, 1, T, H, B)
     fill!(𝕆, 0f0); fill!(ℓ, 0f0); fill!(m, typemin(F))
 
     Tᵣ, Tᶜ = cld(T, Bᵣ), cld(T, Bᶜ)
@@ -188,6 +195,71 @@ function flash_attention₁(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::Abs
     return 𝕆
 end
 
+function flash_attention₁(
+    Q::AbstractArray{F,4},
+    K::AbstractArray{F,4},
+    V::AbstractArray{F,4},
+    window,
+) where F
+    _, H, T, B = size(Q)
+    𝕆 = similar(Q)
+    ℓ = similar(Q, 1, T, H, B)
+    m = similar(Q, 1, T, H, B)
+
+    return flash_attention₁!(𝕆, ℓ, m, Q, K, V, window)
+end
+
+"""
+Source: https://arxiv.org/abs/2205.14135
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+𝐀𝐥𝐠𝐨𝐫𝐢𝐭𝐡𝐦 𝟒: FʟᴀsʜAᴛᴛᴇɴᴛɪᴏɴ Backward Pass
+𝐑𝐞𝐪𝐮𝐢𝐫𝐞: Matrices 𝐐, 𝐊, 𝐕, 𝐎, d𝐎 ∈ ℝᴺˣᵈ in HBM,
+          vectors ℓ, m ∈ ℝᴺ in HBM, on-chip SRAM of size M,
+          softmax scaling constant τ ∈ ℝ, masking function MASK,
+          dropout probability p_drop, pseudo-random number generator
+          state ℛ from the forward pass.
+1: Set the pseudo-random number generator state to ℛ.
+2: Set block sizes B_c = ⌈M / 4d⌉, Bᵣ = min(⌈M / 4d⌉, d).
+3: Divide 𝐐 into Tᵣ = ⌈N / Bᵣ⌉ blocks 𝐐₁, …, 𝐐_Tᵣ of size Bᵣ × d each,
+   and divide 𝐊, 𝐕 into T_c = ⌈N / B_c⌉ blocks
+   𝐊₁, …, 𝐊_T_c and 𝐕₁, …, 𝐕_T_c, of size B_c × d each.
+4: Divide 𝐎 into Tᵣ blocks 𝐎ᵢ, …, 𝐎_Tᵣ of size Bᵣ × d each,
+   divide d𝐎 into Tᵣ blocks d𝐎ᵢ, …, d𝐎_Tᵣ of size Bᵣ × d each,
+   divide ℓ into Tᵣ blocks ℓᵢ, …, ℓ_Tᵣ of size Bᵣ each,
+   divide m into Tᵣ blocks mᵢ, …, m_Tᵣ of size Bᵣ each.
+5: Initialize d𝐐 = (0)ᴺˣᵈ in HBM and divide it into Tᵣ blocks
+   d𝐐₁, …, d𝐐_Tᵣ of size Bᵣ × d each.
+   Initialize d𝐊 = (0)ᴺˣᵈ, d𝐕 = (0)ᴺˣᵈ in HBM and divide d𝐊, d𝐕
+   into T_c blocks d𝐊₁, …, d𝐊_T_c and d𝐕₁, …, d𝐕_T_c,
+   of size B_c × d each.
+6: 𝐟𝐨𝐫 1 ≤ j ≤ T_c 𝐝𝐨
+7:     Load 𝐊ⱼ, 𝐕ⱼ from HBM to on-chip SRAM.
+8:     Initialize d𝐊̃ⱼ = (0)ᴮᶜˣᵈ, d𝐕̃ⱼ = (0)ᴮᶜˣᵈ on SRAM.
+9:     𝐟𝐨𝐫 1 ≤ i ≤ Tᵣ 𝐝𝐨
+10:        Load 𝐐ᵢ, 𝐎ᵢ, d𝐎ᵢ, d𝐐ᵢ, ℓᵢ, mᵢ from HBM to on-chip SRAM.
+11:        On chip, compute 𝐒ᵢⱼ = τ𝐐ᵢ𝐊ⱼᵀ ∈ ℝᴮʳˣᴮᶜ.
+12:        On chip, compute 𝐒ᵢⱼᵐᵃˢᵏᵉᵈ = MASK(𝐒ᵢⱼ).
+13:        On chip, compute
+           𝐏ᵢⱼ = diag(ℓᵢ)⁻¹ exp(𝐒ᵢⱼᵐᵃˢᵏᵉᵈ − mᵢ) ∈ ℝᴮʳˣᴮᶜ.
+14:        On chip, compute dropout mask 𝐙ᵢⱼ ∈ ℝᴮʳˣᴮᶜ,
+           where each entry has value 1 / (1 − p_drop) with probability
+           1 − p_drop and value 0 with probability p_drop.
+15:        On chip, compute 𝐏ᵢⱼᵈʳᵒᵖᵖᵉᵈ = 𝐏ᵢⱼ ∘ 𝐙ᵢⱼ
+           (pointwise multiply).
+16:        On chip, compute d𝐕̃ⱼ ← d𝐕̃ⱼ + (𝐏ᵢⱼᵈʳᵒᵖᵖᵉᵈ)ᵀd𝐎ᵢ ∈ ℝᴮᶜˣᵈ.
+17:        On chip, compute d𝐏ᵢⱼᵈʳᵒᵖᵖᵉᵈ = d𝐎ᵢd𝐕̃ⱼᵀ ∈ ℝᴮʳˣᴮᶜ.
+18:        On chip, compute d𝐏ᵢⱼ = d𝐏ᵢⱼᵈʳᵒᵖᵖᵉᵈ ∘ 𝐙ᵢⱼ
+           (pointwise multiply).
+19:        On chip, compute 𝐃ᵢ = rowsum(d𝐎ᵢ ∘ 𝐎ᵢ) ∈ ℝᴮʳ.
+20:        On chip, compute d𝐒ᵢⱼ = 𝐏ᵢⱼ ∘ (d𝐏ᵢⱼ − 𝐃ᵢ) ∈ ℝᴮʳˣᴮᶜ.
+21:        Write d𝐐ᵢ ← d𝐐ᵢ + τd𝐒ᵢⱼ𝐊ⱼ ∈ ℝᴮʳˣᵈ to HBM.
+22:        On chip, compute d𝐊̃ⱼ ← d𝐊̃ⱼ + τd𝐒ᵢⱼᵀ𝐐ᵢ ∈ ℝᴮᶜˣᵈ.
+23:    𝐞𝐧𝐝 𝐟𝐨𝐫
+24:    Write d𝐊ⱼ ← d𝐊̃ⱼ, d𝐕ⱼ ← d𝐕̃ⱼ to HBM.
+25: 𝐞𝐧𝐝 𝐟𝐨𝐫
+26: Return d𝐐, d𝐊, d𝐕.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
 function Δflash_attention₁()
 
 end
