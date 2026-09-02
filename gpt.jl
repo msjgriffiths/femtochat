@@ -27,11 +27,21 @@ function (ℓ::Linear)(x::AbstractArray)
 end
 
 (𝔼::Embedding)(token_ids::AbstractVector{<:Integer}) = 𝔼.𝔼[:, token_ids]
-function (e::Embedding)(tokens::AbstractMatrix{<:Integer})
-    D = size(e.𝔼, 1)
+
+function (𝔼::Embedding)(tokens::AbstractMatrix{<:Integer})
+    D = size(𝔼.𝔼, 1)
     T, B = size(tokens)
 
-    reshape(e.𝔼[:, vec(tokens)], D, T, B)
+    reshape(𝔼.𝔼[:, vec(tokens)], D, T, B)
+end
+
+leading_channels(x, n) = x[1:n, :, :]
+smear_input(x) = x[1:24, 2:end, :]
+
+function smear(x, gate)
+    y = copy(x)
+    @views y[:, 2:end, :] .+= gate .* x[:, 1:end-1, :]
+    y
 end
 
 function (m::MLP)(x::AbstractArray)
@@ -79,7 +89,7 @@ function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Unio
     # ... as opposed to a skip connection from an earlier (first) layer (ResFormer)
     if !isnothing(𝕧𝕖)
         VE = reshape(ve, head_dim, n_kv_head, T, B) # Match shape of V above 
-        gate = 3sigmoid(𝕧𝕖(x[1:12, :, :])) # Range (0, 3)
+        gate = 3sigmoid(𝕧𝕖(leading_channels(x, 12))) # Range (0, 3)
         V .+= reshape(gate, 1, n_kv_head, T, B) .* VE # Residual connection
     end
 
@@ -107,9 +117,8 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     x = norm(x)
 
     # Smear token embeddings together for cheap bigram information
-    gate = λₛ .* σ(ω.smear_gate(@view x[1:24, 2:end, :]))
-    xₛ = copy(@view x[:, 1:end-1, :]) # Create a copy to read from to avoid race condition updating values
-    @views x[:, 2:end, :] .+=  gate .* xₛ
+    gate = λₛ .* σ(ω.smear_gate(smear_input(x)))
+    x = smear(x, gate)
 
     x₀ = x
 
@@ -136,12 +145,15 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     x = norm(x)
 
     softcap = 15f0
-    logits = ω.lm_head(x)[:1:vocab_size, :, :]
+    logits = leading_channels(ω.lm_head(x), vocab_size)
     @. logits = softcap * tanh(logits / softcap)
     logits
 end
 
-function cross_entropy(logits, targets; ignore_index=-1)
+cross_entropy(logits::Array, targets; ignore_index=-1) =
+    cross_entropy(logits, targets, ignore_index)
+
+function cross_entropy(logits::Array, targets, ignore_index)
     V, T, B = size(logits)
     total = zero(eltype(logits))
     count = 0
@@ -167,14 +179,42 @@ function cross_entropy(logits, targets; ignore_index=-1)
     total / count
 end
 
+cross_entropy(logits::AbstractArray, targets; ignore_index=-1) =
+    cross_entropy(logits, targets, ignore_index)
+
+function cross_entropy(logits::AbstractArray, targets, ignore_index)
+    V, T, B = size(logits)
+    valid = targets .!= ignore_index
+    target = ifelse.(valid, targets, one(eltype(targets)))
+    offset = reshape(0:V:V*(T*B-1), T, B)
+    index = target .+ offset
+
+    maximum_logit = maximum(logits; dims=1)
+    normalizer = sum(exp.(logits .- maximum_logit); dims=1)
+    target_logit = reshape(reshape(logits, :)[vec(index)], T, B)
+    losses = reshape(maximum_logit .+ log.(normalizer), T, B) .- target_logit
+
+    sum(ifelse.(valid, losses, zero(eltype(losses))); dims=(1, 2)) ./
+        sum(valid; dims=(1, 2))
+end
+
 function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray{<:Integer})
     logits = ω(tokens)
-    cross_entropy(logits, targets)
+    cross_entropy(logits, targets, -1)
 end
 
 function uniform!(ℛ, Θ::AbstractVector, spec::ParamSpec, low, high)
-    paramview(Θ, spec) .=
-        low .+ (high - low) .* rand(ℛ, Float32, spec.shape)
+    parameter = paramview(Θ, spec)
+    Random.rand!(ℛ, parameter)
+    @. parameter = low + (high - low) * parameter
+
+    return nothing
+end
+
+function normal!(ℛ, Θ::AbstractVector, spec::ParamSpec, standard_deviation)
+    parameter = paramview(Θ, spec)
+    Random.randn!(ℛ, parameter)
+    parameter .*= standard_deviation
 
     return nothing
 end
@@ -188,8 +228,8 @@ function initialize!(params::Params, layout, ℛ = Random.default_rng())
     n_layer = length(blocks)
     s = √(3f0 / D) # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
 
-    paramview(Θ, embedding) .= .8f0 .* randn(ℛ, Float32, embedding.shape)
-    paramview(Θ, lm_head) .= 0.001f0 .* randn(ℛ, Float32, layout.lm_head.shape)
+    normal!(ℛ, Θ, embedding, 0.8f0)
+    normal!(ℛ, Θ, lm_head, 0.001f0)
     for (i, block) in enumerate(blocks)
         (; 👀, 🍰, λᵦ, λx₀) = block
         (; 𝕎, 𝕂, 𝕍, ℙ, 𝕧𝕖) = 👀
