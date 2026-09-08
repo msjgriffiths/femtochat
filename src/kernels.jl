@@ -134,15 +134,15 @@ function flash_attention₁!(
     m̃, ℓ̃, mⁿᵉʷ, eᵐ, eᵐ̃, ℓⁿᵉʷ =
         ntuple(_ -> similar(Q, 1, Bᵣ), 6)
 
-    for document in 1:B, head in 1:H
+     @inbounds for document in 1:B, head in 1:H
         kv_head = cld(head, heads_per_kv)
 
-        for j in 1:Tᶜ
+         @inbounds for j in 1:Tᶜ
             blockⱼ = (j - 1) * Bᶜ + 1:min(j * Bᶜ, T)
             Kⱼ = @view K[:, kv_head, blockⱼ, document]
             Vⱼ = @view V[:, kv_head, blockⱼ, document]
 
-            for i in 1:Tᵣ
+             @inbounds for i in 1:Tᵣ
                 blockᵢ = (i - 1) * Bᵣ + 1:min(i * Bᵣ, T)
                 nᵢ, nⱼ = length(blockᵢ), length(blockⱼ)
                 # Views to avoid allocations
@@ -290,17 +290,17 @@ function Δflash_attention₁!(
     Dᵢ = similar(Q, 1, Bᵣ)
     dOO = similar(Q, D, Bᵣ)
 
-    for document in 1:B, head in 1:H
+     @inbounds for document in 1:B, head in 1:H
         kv_head = cld(head, heads_per_kv)
 
-        for j in 1:Tᶜ
+         @inbounds for j in 1:Tᶜ
             blockⱼ = (j - 1) * Bᶜ + 1:min(j * Bᶜ, T)
             Kⱼ = @view K[:, kv_head, blockⱼ, document]
             Vⱼ = @view V[:, kv_head, blockⱼ, document]
             dKⱼ = @view dK[:, kv_head, blockⱼ, document]
             dVⱼ = @view dV[:, kv_head, blockⱼ, document]
 
-            for i in 1:Tᵣ
+             @inbounds for i in 1:Tᵣ
                 blockᵢ = (i - 1) * Bᵣ + 1:min(i * Bᵣ, T)
                 nᵢ, nⱼ = length(blockᵢ), length(blockⱼ)
                 @views begin
