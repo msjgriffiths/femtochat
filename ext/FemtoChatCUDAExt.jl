@@ -34,10 +34,10 @@ function flash_attention₁!(
     K::CuArray{F,4},
     V::CuArray{F,4},
     window,
-) where F
+    ::Val{Bᵣ}=Val(16),
+    ::Val{Bᶜ}=Val(16),
+) where {F,Bᵣ,Bᶜ}
     D, H, T, B = size(Q)
-
-    Bᵣ, Bᶜ = 16, 16
 
     threads = Bᵣ * Bᶜ
     blocks = (cld(T, Bᵣ), H, B)
