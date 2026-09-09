@@ -243,8 +243,8 @@ function flash_attention₁_kernel!(
         query = blockᵢ + τᵢ
 
         if query <= T
-            ℓ[1, query, head, document] = ℓᵢ[q]
-            m[1, query, head, document] = mᵢ[q]
+            ℓ[1, query, head, document] = ℓᵢ[τᵢ]
+            m[1, query, head, document] = mᵢ[τᵢ]
         end
     end
 
