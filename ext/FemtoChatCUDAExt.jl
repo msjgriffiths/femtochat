@@ -5,9 +5,56 @@ using CUDA: i32
 using FemtoChat
 using Base.Cartesian: @ntuple
 
+# CUDA 6 moved compiler utilities into CUDACore.
+const CUDACompiler = parentmodule(CuDevice)
+using .CUDACompiler: @loopinfo
+
 import FemtoChat.Kernels: flash_attention₁!, Δflash_attention₁!
 
 # ── Configuration ───────────────────────────────────────────────────────────
+
+# CUDA 5.x stores the assembler target as `cap`; newer CUDA stores an SMVersion
+# in `sm`, preserving its architecture/family feature set. LLVM may target less.
+function compiler_targets(config)
+    (; params, target) = config
+    arch = hasproperty(params, :sm) ? params.sm : params.cap
+    feature_set = hasproperty(target, :feature_set) ? target.feature_set : :baseline
+    return (; target=(; arch, ptx=params.ptx),
+              llvm=(; compute=target.cap, feature_set, ptx=target.ptx))
+end
+
+"""
+    capabilities(dev=CUDA.device())
+    capabilities(Q::CuArray)
+
+Report hardware compute capability, CUDA's default compilation target, LLVM's
+target, and device limits. `target.arch` retains CUDA's native SMVersion (including
+`a`/`f`) when available; CUDA 5.x returns a baseline VersionNumber instead.
+Hardware capability is not a promise that the installed toolchain supports it.
+Shared-memory limits are bytes; register limits count 32-bit registers. Opt-in
+shared memory requires a separate launch configuration; it is not enabled here.
+This does not enumerate individual instructions or change the active device.
+"""
+function capabilities(dev::CuDevice=CUDA.device())
+    # Compiler configuration moved from CUDA to CUDACore in CUDA 6. This is the
+    # one internal API dependency: use its target selection, not our own GPU table.
+    (; target, llvm) = compiler_targets(CUDACompiler.compiler_config(dev))
+    attr(code) = CUDA.attribute(dev, code)
+    limits = (
+        warp_size=CUDA.warpsize(dev),
+        multiprocessors=attr(CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT),
+        threads_per_block=attr(CUDA.DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK),
+        threads_per_sm=attr(CUDA.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR),
+        shared_bytes_per_block=attr(CUDA.DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK),
+        shared_bytes_per_block_optin=attr(CUDA.DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN),
+        shared_bytes_per_sm=attr(CUDA.DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR),
+        registers_per_block=attr(CUDA.DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK),
+        registers_per_sm=attr(CUDA.DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR),
+    )
+    return (; name=CUDA.name(dev), compute=CUDA.capability(dev), target, llvm, limits)
+end
+
+capabilities(Q::CuArray) = capabilities(CUDA.device(Q))
 
 # One compile-time description of the FP32 SIMT multiply and its storage.
 const SIMT = (fragment=(8,4), lanes=(4,8), stage=16, vector=4, swizzle=(bits=3, base=2))
@@ -264,7 +311,7 @@ end
 
 # Fold contributions from different column warps, after a block barrier.
 @inline function reduce_row(op::F, x, A, row, ::Val{N}) where {F,N}
-    CUDA.@loopinfo unroll for column in 1:N
+    @loopinfo unroll for column in 1:N
         @inbounds x = op(x, A[row,column])
     end
     return x
@@ -292,10 +339,10 @@ end
     group = min(stage, 1 << Spec.swizzle.base)
 
     # One XOR per vector/group; the unrolled inner loads use constant offsets.
-    @inbounds CUDA.@loopinfo unroll=false for d in Int32(0):Int32(group):Int32(stage-1)
+    @inbounds @loopinfo unroll=false for d in Int32(0):Int32(group):Int32(stage-1)
         ap = ntuple(j -> shared_group_pointer(A,Int32(W*(j-1)),d,Val(LDA),Val(W),Val(mask)), Val(R÷W))
         bp = ntuple(j -> shared_group_pointer(B,Int32(W*(j-1)),d,Val(LDB),Val(W),Val(Layout == :swizzled ? mask : 0)), Val(C÷W))
-        CUDA.@loopinfo unroll for offset in Int32(0):Int32(group-1)
+        @loopinfo unroll for offset in Int32(0):Int32(group-1)
             q = ntuple(j -> unsafe_load(ap[j],1+Int32(LDA÷W)*offset,Val(sizeof(Float32)*W)), Val(R÷W))
             k = ntuple(j -> unsafe_load(bp[j],1+Int32(LDB÷W)*offset,Val(sizeof(Float32)*W)), Val(C÷W))
             previous = x # Capture a value, not the reassigned loop variable.
@@ -330,7 +377,7 @@ end
 
 # Register vectors → strided rows in a shared tile. 
 @inline function stage_rows!(A, x::NTuple{N,Float32ᵛ{W}}, row, row_step, d, ::Val{Rows}) where {N,W,Rows}
-    CUDA.@loopinfo unroll for j in 1:N
+    @loopinfo unroll for j in 1:N
         r = row + (j-1)*row_step
         if Rows % row_step == 0 || r <= Rows
             @inbounds @views copyto!(A[r,d:d+W-1], getfield.(x[j], :value))
@@ -617,7 +664,7 @@ end
     width, pitch = L.vector, L.Dᵥ
     stride = Int32(L.D*size(A,2))
     address = @inbounds LinearIndices(A)[1,head,1,document]
-    CUDA.@loopinfo unroll for j in 0:cld(L.stage*pitch,width*L.threads)-1
+    @loopinfo unroll for j in 0:cld(L.stage*pitch,width*L.threads)-1
         index = τ + Int32(j*L.threads)
         d = Int32(width)*(index % Int32(pitch÷width)) + 1i32
         row = index ÷ Int32(pitch÷width) + 1i32
