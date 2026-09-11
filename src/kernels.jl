@@ -206,7 +206,8 @@ function flash_attention₁(
     ℓ = similar(Q, 1, T, H, B)
     m = similar(Q, 1, T, H, B)
 
-    return flash_attention₁!(𝕆, ℓ, m, Q, K, V, window)
+    flash_attention₁!(𝕆, ℓ, m, Q, K, V, window)
+    return 𝕆
 end
 
 """
@@ -392,7 +393,7 @@ function flash_attention₂(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::Abs
 
 end
 
-attention = flash_attention₁
+attention(Q, K, V, window) = flash_attention₁(Q, K, V, window)
 
 # function attention(Q::CuMatrix, K::CuMatrix, V::CuMatrix, window)
 #     # TODO: FA2 or FA3
