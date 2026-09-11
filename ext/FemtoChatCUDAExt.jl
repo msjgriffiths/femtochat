@@ -63,83 +63,117 @@ end
 # ── Register notation ───────────────────────────────────────────────────────
 
 """
-    @fragment (S=(8,4), m=(8,)) begin ... end
-
-Macro to make handling fragments easier. 
-Allows normal Julia syntax for indexing and assignment, 
-    but expands to static register names.
+    Fragment{Shape}(value)
 See: https://docs.nvidia.com/cuda/parallel-thread-execution/?utm_source=chatgpt.com#warp-level-matrix-fragment
-We're in F32 so it's a vector expression of eight .f32 registers.
 """
-macro fragment(declarations, body)
-    shapes = Dict(name => Tuple(shape.args) for (name,shape) in (d.args for d in declarations.args))
-    isfragment(x) = x isa Symbol ? haskey(shapes,x) :
-        Meta.isexpr(x,:ref) && haskey(shapes,x.args[1])
-    isslice(x) = x isa Symbol || Symbol(":") in x.args[2:end]
+struct Fragment{Shape,T,N}
+    values::NTuple{N,T}
+end
 
-    # Evaluate only static integer indices/ranges; never eval user expressions.
-    function static(x, env)
-        x isa Int && return x
-        x isa Symbol && return get(env,x,nothing)
-        Meta.isexpr(x,:call) && x.args[1] in (:+,:-,:*) || return nothing
-        values = static.(x.args[2:end],Ref(env))
-        return any(isnothing,values) ? nothing : getfield(Base,x.args[1])(values...)
+@inline Fragment{Shape}(x::T) where {Shape,T<:Number} =
+    Fragment{Shape}(ntuple(Returns(x), Val(prod(Shape))))
+@inline Fragment{Shape}(values::NTuple{N,T}) where {Shape,N,T} =
+    Fragment{Shape,T,N}(values)
+
+Base.size(::Fragment{Shape}) where Shape = Shape
+Base.length(::Fragment{Shape,T,N}) where {Shape,T,N} = N
+Base.eltype(::Type{<:Fragment{Shape,T}}) where {Shape,T} = T
+Base.Tuple(S::Fragment) = S.values
+Base.iterate(S::Fragment, state...) = iterate(S.values, state...)
+
+# A slice is an ordinary tuple, so reductions and broadcasts use ordinary Julia.
+# It is a snapshot, not a view. Use one integer or ':' per dimension.
+function coordinates(Shape, I)
+    length(Shape) == length(I) || error("use one index per fragment dimension")
+    ranges = ntuple(d -> I[d] <: Colon ? (1:Shape[d]) : (1:1), length(Shape))
+    positions = CartesianIndices(ranges)
+    coordinates = [ntuple(d -> I[d] <: Colon ? p[d] : :(I[$d]), length(Shape)) for p in positions]
+    vec(coordinates)
+end
+
+function linear_index(Shape, coordinate)
+    terms = [:(($(coordinate[d]) - 1) * $(prod(Shape[1:d-1]))) for d in eachindex(Shape)]
+    :(1 + $(Expr(:call, :+, terms...)))
+end
+
+@inline @generated function Base.getindex(S::Fragment{Shape}, I::Vararg{Union{Integer,Colon},N}) where {Shape,N}
+    values = [:(S.values[$(linear_index(Shape,c))]) for c in coordinates(Shape,I)]
+    result = any(t -> t <: Colon, I) ? Expr(:tuple,values...) : only(values)
+    :(@inbounds $result)
+end
+
+# Rebuild a tuple with the requested scalar/slice replaced. Static indices allow
+# the compiler to discard all the unchanged tuple copies.
+@inline @generated function replaced(S::Fragment{Shape,T}, x, I::Vararg{Union{Integer,Colon},N}) where {Shape,T,N}
+    axes = findall(t -> t <: Colon,I)
+    sliced = LinearIndices(Tuple(Shape[d] for d in axes))
+    values = map(enumerate(CartesianIndices(Shape))) do (i,c)
+        conditions = [:($(c[d]) == I[$d]) for d in eachindex(Shape) if d ∉ axes]
+        selected = foldl((a,b)->:($a && $b),conditions;init=true)
+        value = isempty(axes) ? :x : :(x[$(sliced[Tuple(c[d] for d in axes)...])])
+        :(ifelse($selected, convert(T,$value), S.values[$i]))
     end
+    :(@inbounds $(Expr(:tuple,vec(values)...)))
+end
 
-    # Resolve a scalar or ':' slice in column-major order.
-    function registers(ref, indices)
-        if ref isa Symbol
-            ref = Expr(:ref,ref,fill(Symbol(":"),length(shapes[ref]))...)
+@inline Base.setindex(S::Fragment{Shape}, x, I...) where Shape =
+    Fragment{Shape}(replaced(S,x,I...))
+
+# Unroll literal loop bounds, leaving arithmetic and indexing to Julia.
+function unroll(x, indices=Dict{Symbol,Int}())
+    x isa Symbol && return get(indices,x,x)
+    x isa Expr || return x
+    x.head in (:quote, :function, :->, :let) && return x
+    if x.head == :for
+        binding, loop = x.args
+        if Meta.isexpr(binding,:block)
+            return unroll(foldr((b,tail)->Expr(:for,b,tail),binding.args;init=loop),indices)
         end
-        name, shape = ref.args[1], shapes[ref.args[1]]
-        length(ref.args) == length(shape)+1 || throw(ArgumentError("incorrect fragment rank: $name"))
-        ranges = map(ref.args[2:end],shape) do index,d
-            index == Symbol(":") && return 1:d
-            i = static(index,indices)
-            isnothing(i) && throw(ArgumentError("fragment indices must be static: $name"))
-            return i:i
+        name, range = binding.args
+        range = unroll(range,indices)
+        if Meta.isexpr(range,:call) && range.args[1] == :(:) && all(i->i isa Int,range.args[2:end])
+            return Expr(:block,[unroll(loop,merge(indices,Dict(name=>i))) for i in (:)(range.args[2:end]...)]...)
         end
-        linear = LinearIndices(shape)
-        return vec([Symbol(name,:_,linear[I]) for I in CartesianIndices(Tuple(ranges))])
     end
+    Expr(x.head,map(a->unroll(a,indices),x.args)...)
+end
 
-    function expand(x, indices=Dict{Symbol,Int}())
-        if x isa Symbol
-            return isfragment(x) ? Expr(:tuple,registers(x,indices)...) : get(indices,x,x)
+function assignments(x)
+    x isa Expr || return x
+    x.head in (:quote,:function,:->,:let) && return x
+    if x.head in (:(=),:(+=),:(-=),:(*=),:(/=)) && Meta.isexpr(x.args[1],:ref)
+        ref, rhs = x.args
+        A, I = ref.args[1], ref.args[2:end]
+        A isa Symbol || error("@fragment assignment requires a local variable")
+        object, indices, value = gensym.((:object,:indices,:value))
+        if x.head != :(=)
+            op = Symbol(chop(string(x.head)))
+            rhs = :($op(getindex($object,$indices...),$rhs))
         end
-        x isa Expr || return x
-        x.head in (:break,:continue,:function,:->,:let,:quote) &&
-            throw(ArgumentError("@fragment does not support $(x.head)"))
-        if x.head == :macrocall && !(x.args[1] in (Symbol("@inbounds"),Symbol("@views")))
-            return x # Other macros keep their own binding/expansion rules.
-        elseif x.head == :for
-            binding, loop = x.args
-            if Meta.isexpr(binding,:block)
-                nested = foldr((b,tail) -> Expr(:for,b,tail),binding.args;init=loop)
-                return expand(nested,indices)
+        return quote
+            local $object = $A
+            local $indices = ($(I...),)
+            local $value = $rhs
+            if $object isa $(GlobalRef(@__MODULE__,:Fragment))
+                $A = Base.setindex($object,$value,$indices...)
+            else
+                setindex!($object,$value,$indices...)
             end
-            name, range = binding.args
-            haskey(indices,name) && throw(ArgumentError("do not shadow an unrolled index"))
-            if Meta.isexpr(range,:call) && range.args[1] == :(:)
-                limits = static.(range.args[2:end],Ref(indices))
-                if all(!isnothing,limits)
-                    return Expr(:block,[expand(loop,merge(indices,Dict(name=>i))) for i in (:)(limits...)]...)
-                end
-            end
-        elseif x.head in (:(=),:(+=),:(-=),:(*=),:(/=)) &&
-               x.args[1] isa Symbol && haskey(indices,x.args[1])
-            throw(ArgumentError("do not assign to an unrolled index"))
-        elseif Meta.isexpr(x,:(=),2) && isfragment(x.args[1]) && isslice(x.args[1])
-            # Ordinary tuple assignment evaluates the RHS once before unpacking.
-            lhs = Expr(:tuple,registers(x.args[1],indices)...)
-            return Expr(:(=),lhs,expand(x.args[2],indices))
-        elseif isfragment(x)
-            values = registers(x,indices)
-            return isslice(x) ? Expr(:tuple,values...) : only(values)
+            $value
         end
-        return Expr(x.head,map(a -> expand(a,indices),x.args)...)
     end
-    return esc(expand(body))
+    Expr(x.head,map(assignments,x.args)...)
+end
+
+"""
+    @fragment begin ... end
+
+Unroll literal loops and rebind immutable fragments on indexed assignment.
+Fragments must already be constructed explicitly. Other arrays retain mutation.
+No variable names, fragment shapes, reductions, or multiply names are recognized.
+"""
+macro fragment(body)
+    esc(assignments(unroll(body)))
 end
 
 
@@ -275,6 +309,11 @@ end
 end
 
 
+# Preserve the fragment's shape around the tuple-level register multiply.
+@inline function Base.muladd(a::A, b::B, x::Fragment{Shape}, rest::Vararg{Any,N}) where {A,B,Shape,N}
+    Fragment{Shape}(muladd(a,b,x.values,rest...))
+end
+
 # ── Cooperative staging ────────────────────────────────────────────────────
 
 # Q and K share one double-buffered channel stage.
@@ -327,7 +366,7 @@ end
     Nq, Nk = cld(stage*Bᵣ, vector*threads), cld(stage*Bᶜ, vector*threads)
     No = cld(D, Bᶜ)
     Nv = cld(stage*Dᵥ, vector*threads)
-    return :(@fragment (S=($R,$C), 𝕆ᵢ=($R,$C,$No), mᵢ=($R,), ℓᵢ=($R,)) begin
+    return :(@fragment begin
         window = Window
         causal = window == (-1,0)
         left, right = window
@@ -361,9 +400,9 @@ end
         V_offset_bytes = sizeof(Float32) * layout.V_offset
         P̃ᵢⱼ = Swizzled(CuDynamicSharedArray(Float32, (Bᵣ, Bᶜ), 0), Val(layout.swizzle))
         stats = CuDynamicSharedArray(Float32, (Bᵣ, Wᶜ), V_offset_bytes)
-        𝕆ᵢ = ntuple(Returns(0f0), Val($R*$C*$No))
-        mᵢ = ntuple(Returns(-floatmax(Float32)), Val($R))
-        ℓᵢ = ntuple(Returns(0f0), Val($R))
+        𝕆ᵢ = Fragment{($R,$C,$No)}(0f0)
+        mᵢ = Fragment{($R,)}(-floatmax(Float32))
+        ℓᵢ = Fragment{($R,)}(0f0)
 
         # Each thread transfers one contiguous channel vector.
         vectors_per_row = Int32(stage ÷ width)
@@ -397,7 +436,7 @@ end
             sync_threads()
 
             # Sᵢⱼ = QᵢKⱼ'. 
-            S = ntuple(Returns(0f0), Val($R*$C))
+            S = Fragment{($R,$C)}(0f0)
             for channel₀ in 0i32:Int32(stage):(padded_D-1i32)
                 next_channel = (channel₀ + Int32(stage)) % padded_D
                 qᵥ = @ntuple $Nq j ->
@@ -597,7 +636,7 @@ end
     R, C = L.fragment
     Bᶜ, Bᵣ = L.tile
     Nk, Nq = cld(L.D,Bᵣ), cld(L.D,Bᶜ)
-    return :(@fragment (S=($R,$C), dP=($R,$C), dKⱼ=($R,$C,$Nk), dVⱼ=($R,$C,$Nk), dQᵢ=($R,$C,$Nq)) begin
+    return :(@fragment begin
         layout, query_layout = L, LQ
         D, stage = layout.D, layout.stage
         Bᶜ, Bᵣ = layout.tile
@@ -623,15 +662,15 @@ end
         dSᵀᵢⱼ = Swizzled(CuDynamicSharedArray(Float32,(Bᵣ,Bᶜ),0), Val(layout.swizzle))
         operand = CuDynamicSharedArray(Float32,(layout.Dᵥ,stage),sizeof(Float32)*Bᶜ*Bᵣ)
         key_operand = CuDynamicSharedArray(Float32,(query_layout.Dᵥ,stage),sizeof(Float32)*Bᶜ*Bᵣ)
-        dKⱼ = ntuple(Returns(0f0), Val($R*$C*$Nk))
-        dVⱼ = ntuple(Returns(0f0), Val($R*$C*$Nk))
+        dKⱼ = Fragment{($R,$C,$Nk)}(0f0)
+        dVⱼ = Fragment{($R,$C,$Nk)}(0f0)
         first_query = causal ? fld(blockⱼ,Bᵣ)*Bᵣ : max(0i32,fld(blockⱼ-right,Bᵣ)*Bᵣ)
         last_query = causal ? T-1i32 : min(T-1i32,blockⱼ+Bᶜ-1+left)
 
         for head in (kv_head-1)*heads_per_kv+1:kv_head*heads_per_kv
             for blockᵢ in Int32(first_query):Int32(Bᵣ):Int32(last_query)
-                S = ntuple(Returns(0f0), Val($R*$C))
-                dP = ntuple(Returns(0f0), Val($R*$C))
+                S = Fragment{($R,$C)}(0f0)
+                dP = Fragment{($R,$C)}(0f0)
                 for d₀ in 0i32:Int32(stage):Int32(D-1)
                     # S = KQ'; dP = VdO'. Shared stages are reused after each product.
                     stage_channels!(Kⱼ,K,kv_head,document,blockⱼ,d₀,Val(Bᶜ),Val(layout))
@@ -698,7 +737,7 @@ end
                     dSᵀᵢⱼ[col₀+c,row₀+r] = dP[r,c]
                 end
                 sync_threads()
-                dQᵢ = ntuple(Returns(0f0), Val($R*$C*$Nq))
+                dQᵢ = Fragment{($R,$C,$Nq)}(0f0)
                 for k₀ in 0i32:Int32(stage):Int32(Bᶜ-1)
                     stage_values!(key_operand,K,kv_head,document,blockⱼ+k₀,Val(query_layout))
                     sync_threads()
