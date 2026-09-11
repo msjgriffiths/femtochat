@@ -2,14 +2,19 @@ module FemtoChatCUDAExt
 
 using CUDA
 using CUDA: i32
+using LinearAlgebra: mul!
 using FemtoChat
 using Base.Cartesian: @ntuple
 
 # CUDA 6 moved compiler utilities into CUDACore.
 const CUDACompiler = parentmodule(CuDevice)
 using .CUDACompiler: @loopinfo
+const LLVM = CUDACompiler.LLVM
+using .LLVM.Interop: create_function, call_function
 
-import FemtoChat.Kernels: flash_attention₁!, Δflash_attention₁!
+import FemtoChat.Kernels: attention, attention!, Δattention!, attention_state,
+                         attention_inputs, accumulator_type, attention_mask!,
+                         flash_attention₁, flash_attention₁!, Δflash_attention₁!
 
 # ── Configuration ───────────────────────────────────────────────────────────
 
@@ -55,6 +60,40 @@ function capabilities(dev::CuDevice=CUDA.device())
 end
 
 capabilities(Q::CuArray) = capabilities(CUDA.device(Q))
+
+struct SIMTInstruction end
+struct TensorCoreInstruction end
+const TENSOR_CORE = (warps=4,key_tile=64)
+
+instruction(::Type, dev::CuDevice, ::Val) = SIMTInstruction()
+function instruction(::Type{F}, dev::CuDevice, ::Val{D}) where {F<:Union{Float16,Float32},D}
+    D > 0 && D % 16 == 0 || return SIMTInstruction()
+    Bᵣ,Bᶜ = 16TENSOR_CORE.warps,TENSOR_CORE.key_tile
+    shared = sizeof(Float16)*(D+8)*(max(Bᵣ,Bᶜ)+Bᶜ)
+    shared <= CUDA.attribute(dev,CUDA.DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK) ||
+        return SIMTInstruction()
+    target = compiler_targets(CUDACompiler.compiler_config(dev)).llvm.compute
+    CUDA.capability(dev) >= v"8.0" && target >= v"8.0" ?
+        TensorCoreInstruction() : SIMTInstruction()
+end
+
+attention_state(::typeof(attention), Q::CuArray, K::CuArray, V::CuArray, window) =
+    attention_state(instruction(eltype(Q),CUDA.device(Q),Val(size(Q,1))),Q,K,V,window)
+
+accumulator_type(::TensorCoreInstruction, ::Type) = Float32
+attention_inputs(::TensorCoreInstruction, Q::CuArray{Float32}, K, V) =
+    Float16.(Q),Float16.(K),Float16.(V)
+
+attention!(::SIMTInstruction, args...; kwargs...) = flash_attention₁!(args...;kwargs...)
+Δattention!(::SIMTInstruction, args...; kwargs...) = Δflash_attention₁!(args...;kwargs...)
+
+function attention(Q::CuArray{F,4}, K::CuArray{F,4}, V::CuArray{F,4}, window) where {F<:AbstractFloat}
+    attention_state(attention,Q,K,V,window).O
+end
+
+# Explicit instruction selection is useful for tests and tile benchmarks.
+attention(𝒜::Union{SIMTInstruction,TensorCoreInstruction}, Q, K, V, window; kwargs...) =
+    attention_state(𝒜,Q,K,V,window;kwargs...).O
 
 # One compile-time description of the FP32 SIMT multiply and its storage.
 const SIMT = (fragment=(8,4), lanes=(4,8), stage=16, vector=4, swizzle=(bits=3, base=2))
@@ -814,6 +853,345 @@ end
         end
         return nothing
     end)
+end
+
+# ── Tensor Core attention ──────────────────────────────────────────────────
+
+"""
+    attention!(::TensorCoreInstruction, O, ℓ, m, Q, K, V, window;
+               warps=Val(4), key_tile=Val(64))
+
+Preallocated Tensor Core forward pass. O may be Float16 or Float32; ℓ and m must
+be Float32 with shape (1,T,H,B). Each warp owns 16 queries, so the query tile is
+16 × warps. The kernel overwrites O, ℓ, and m; no clearing is needed between calls.
+Inputs must be nonempty, with Q's head count divisible by the KV head count.
+Arrays must have compatible shapes and reside on the active device. The window
+is causal (-1,0), or a pair of nonnegative left/right extents. This implementation
+uses an FA2-style query-tile schedule; that scheduling choice is separate from
+the Tensor Core instruction set. Requires an SM80+ device and compiler target.
+"""
+function attention!(::TensorCoreInstruction,
+    O::CuArray{F,4}, ℓ::CuArray{Float32,4}, m::CuArray{Float32,4},
+    Q::CuArray{Float16,4}, K::CuArray{Float16,4}, V::CuArray{Float16,4}, window;
+    warps::Val{W}=Val(TENSOR_CORE.warps), key_tile::Val{Bᶜ}=Val(TENSOR_CORE.key_tile),
+) where {F<:Union{Float16,Float32},W,Bᶜ}
+    D,H,T,B = size(Q)
+    @assert D > 0 && D % 16 == 0 && Bᶜ > 0 && Bᶜ % 16 == 0
+    heads_per_kv = Val(H÷size(K,2))
+    @cuda threads=32W blocks=(cld(T,16W),H,B) attention_kernel!(
+        TensorCoreInstruction(),O,ℓ,m,Q,K,V,Val(window),Val(D),warps,key_tile,heads_per_kv)
+    nothing
+end
+
+# Eight half values, moved as one aligned 128-bit vector without conversion.
+const Half8 = NTuple{4,VecElement{Int32}}
+@inline function copy8!(destination,source,d,q,head,token,document)
+    @inbounds begin
+        index = LinearIndices(source)[d,head,token,document]
+        input = reinterpret(Core.LLVMPtr{Half8,CUDA.AS.Global},pointer(source,index))
+        value = token <= size(source,3) ? CUDA.unsafe_cached_load(input,1,Val(16)) :
+            ntuple(_ -> VecElement(Int32(0)),Val(4))
+        output = reinterpret(Core.LLVMPtr{Half8,CUDA.AS.Shared},pointer(destination,d+(q-1)*size(destination,1)))
+        unsafe_store!(output,value,1,Val(16))
+    end
+    nothing
+end
+
+@inline pack(x::Float16,y::Float16) = UInt32(reinterpret(UInt16,x)) | (UInt32(reinterpret(UInt16,y)) << 16)
+@inline pack(x::Float32,y::Float32) = pack(Float16(x),Float16(y))
+
+# ldmatrix consumes a 32-bit byte address in the shared-memory address space.
+@inline function shared_address(A,row,column)
+    @inbounds address = pointer(A,row+(column-1)*size(A,1))
+    reinterpret(UInt,address) % UInt32
+end
+
+@inline @generated function load_matrix(address::UInt32, ::Val{N}, ::Val{Transpose}) where {N,Transpose}
+    LLVM.Context() do _
+        result_type = convert(LLVM.LLVMType,NTuple{N,UInt32})
+        pointer_type = LLVM.PointerType(LLVM.Int8Type(),3)
+        f,_ = create_function(result_type,[LLVM.Int32Type()])
+        signature = LLVM.FunctionType(LLVM.StructType(fill(LLVM.Int32Type(),N)),[pointer_type])
+        name = "llvm.nvvm.ldmatrix.sync.aligned.m8n8.x$N$(Transpose ? ".trans" : "").b16.p3"
+        instruction = LLVM.Function(LLVM.parent(f),name,signature)
+        push!(LLVM.function_attributes(instruction),LLVM.EnumAttribute("convergent"))
+        LLVM.IRBuilder() do builder
+            LLVM.position!(builder,LLVM.BasicBlock(f,"entry"))
+            pointer = LLVM.inttoptr!(builder,only(LLVM.parameters(f)),pointer_type)
+            values = LLVM.call!(builder,signature,instruction,[pointer])
+            push!(LLVM.function_attributes(values),LLVM.EnumAttribute("convergent"))
+            # Return Julia's tuple representation directly: a C-ABI struct
+            # return introduces out-of-line calls in the full attention kernel.
+            result = LLVM.UndefValue(result_type)
+            for i in 0:N-1
+                result = LLVM.insert_value!(builder,result,LLVM.extract_value!(builder,values,i),i)
+            end
+            LLVM.ret!(builder,result)
+        end
+        call_function(f,NTuple{N,UInt32},Tuple{UInt32},:address)
+    end
+end
+
+@inline query_matrix(Q,q,d,lane) = load_matrix(
+    shared_address(Q,d+8*(lane÷16)+1,q+lane%16+1),Val(4),Val(false))
+@inline key_matrix(K,k,d,lane) = load_matrix(
+    shared_address(K,d+8*((lane÷8)%2)+1,k+lane%8+1),Val(2),Val(false))
+@inline value_matrix(V,k,d,lane) = load_matrix(
+    shared_address(V,d+1,k+lane%16+1),Val(2),Val(true))
+
+# NVIDIA m16n8k16: packed half inputs and four FP32 accumulators per lane.
+# LLVM18 needs the explicit convergent attribute before NVPTX lowering.
+# The owned Fragment argument makes this Base extension local to our notation.
+@inline @generated function Base.muladd(A::NTuple{4,UInt32}, B::NTuple{2,UInt32}, C::Fragment{(4,),Float32,4})
+    multiply = LLVM.Context() do _
+        result_type = convert(LLVM.LLVMType,NTuple{4,Float32})
+        argument_types = [convert(LLVM.LLVMType,T) for T in (A,B,NTuple{4,Float32})]
+        f,_ = create_function(result_type,argument_types)
+        MMA = LLVM.FunctionType(LLVM.StructType(fill(LLVM.FloatType(),4)),
+            [fill(LLVM.VectorType(LLVM.HalfType(),2),6);fill(LLVM.FloatType(),4)])
+        instruction = LLVM.Function(LLVM.parent(f),"llvm.nvvm.mma.m16n8k16.row.col.f32.f32",MMA)
+        push!(LLVM.function_attributes(instruction),LLVM.EnumAttribute("convergent"))
+        LLVM.IRBuilder() do builder
+            LLVM.position!(builder,LLVM.BasicBlock(f,"entry"))
+            a,b,c = LLVM.parameters(f)
+            packed = [LLVM.extract_value!(builder,x,i) for x in (a,b) for i in 0:(x === a ? 3 : 1)]
+            inputs = LLVM.Value[LLVM.bitcast!(builder,x,LLVM.VectorType(LLVM.HalfType(),2)) for x in packed]
+            append!(inputs,[LLVM.extract_value!(builder,c,i) for i in 0:3])
+            product = LLVM.call!(builder,MMA,instruction,inputs)
+            push!(LLVM.function_attributes(product),LLVM.EnumAttribute("convergent"))
+            result = LLVM.UndefValue(result_type)
+            for i in 0:3
+                result = LLVM.insert_value!(builder,result,LLVM.extract_value!(builder,product,i),i)
+            end
+            LLVM.ret!(builder,result)
+        end
+        call_function(f,NTuple{4,Float32},Tuple{A,B,NTuple{4,Float32}},:A,:B,:(Tuple(C)))
+    end
+    :(Fragment{(4,)}($multiply))
+end
+
+# Approximate only the exponential, not the surrounding masked-tail Inf checks.
+@inline exp₂(x::Float32) = ccall("llvm.nvvm.ex2.approx.ftz.f",llvmcall,Float32,(Float32,),x)
+
+@generated function attention_kernel!(::TensorCoreInstruction,O,ℓ,m,Q,K,V,
+    ::Val{Window}, ::Val{D}, ::Val{W}, ::Val{Bᶜ}, ::Val{Groups},
+) where {Window,D,W,Bᶜ,Groups}
+    Bᵣ = 16W
+    quote
+        i,head,document = blockIdx()
+        thread = threadIdx().x
+        warp,lane = (thread-1i32) ÷ 32i32, (thread-1i32) % 32i32
+        group,part = lane ÷ 4i32, lane % 4i32
+        T = size(Q,3) % Int32
+        kv_head = (head-1i32) ÷ $(Int32(Groups)) + 1i32
+        blockᵢ = (i-1i32)*$(Int32(Bᵣ))
+        q = warp*16i32 + group + 1i32
+        query = blockᵢ+q
+        left,right = $Window
+        τ = $(Float32(log2(exp(1.0))/sqrt(D)))
+
+        # Padding rotates shared banks. Q's storage becomes K after loading A.
+        Qᵢ = CuStaticSharedArray(Float16,($(D+8),$(max(Bᵣ,Bᶜ))))
+        Kⱼ = Qᵢ
+        Vⱼ = CuStaticSharedArray(Float16,($(D+8),$Bᶜ))
+        for index in thread:$(32W):$(D÷8*Bᵣ)
+            d,row = 8i32*((index-1i32) % $(Int32(D÷8))) + 1i32, (index-1i32) ÷ $(Int32(D÷8)) + 1i32
+            copy8!(Qᵢ,Q,d,row,head,blockᵢ+row,document)
+        end
+        sync_threads()
+
+        A = Fragment{(4,$(D÷16))}(UInt32(0))
+        @fragment for d in 1:$(D÷16)
+            A[:,d] = query_matrix(Qᵢ,warp*16,16(d-1),lane)
+        end
+        # No warp may overwrite Q until every warp has captured its queries.
+        sync_threads()
+        𝕆 = Fragment{(4,$(D÷8))}(0f0)
+        m₁,m₂ = -Inf32,-Inf32
+        ℓ₁,ℓ₂ = 0f0,0f0
+        first_key = $Window == (-1,0) ? 0i32 : max(0i32,blockᵢ-left) ÷ $(Int32(Bᶜ)) * $(Int32(Bᶜ))
+        last_key = min(T,blockᵢ+$(Int32(Bᵣ))+right)
+
+        for blockⱼ in first_key:$(Int32(Bᶜ)):(last_key-1i32)
+            for index in thread:$(32W):$(D÷8*Bᶜ)
+                d,k = 8i32*((index-1i32) % $(Int32(D÷8))) + 1i32, (index-1i32) ÷ $(Int32(D÷8)) + 1i32
+                copy8!(Kⱼ,K,d,k,kv_head,blockⱼ+k,document)
+                copy8!(Vⱼ,V,d,k,kv_head,blockⱼ+k,document)
+            end
+            sync_threads()
+
+            S = Fragment{(4,$(Bᶜ÷8))}(0f0)
+            @fragment for d in 1:$(D÷16), n in 1:$(Bᶜ÷8)
+                B = key_matrix(Kⱼ,8(n-1),16(d-1),lane)
+                S[:,n] = muladd(A[:,d],B,Fragment{(4,)}(S[:,n]))
+            end
+
+            m̃₁,m̃₂ = -Inf32,-Inf32
+            # A causal tile entirely before this query block needs no mask.
+            if $(Window == (-1,0)) && blockⱼ+$(Int32(Bᶜ)) <= blockᵢ
+                @fragment for n in 1:$(Bᶜ÷8), r in 1:4
+                    S[r,n] *= τ
+                end
+            else
+                @fragment for n in 1:$(Bᶜ÷8), r in 1:4
+                    key = blockⱼ + 8(n-1) + 2part + mod(r-1,2) + 1
+                    row = query + 8*((r-1)÷2)
+                    valid = row <= T && key <= T && ($Window == (-1,0) ? key <= row : row-left <= key <= row+right)
+                    S[r,n] = valid ? S[r,n]*τ : -Inf32
+                end
+            end
+            @fragment for n in 1:$(Bᶜ÷8)
+                m̃₁ = max(m̃₁,S[1,n],S[2,n])
+                m̃₂ = max(m̃₂,S[3,n],S[4,n])
+            end
+            m̃₁,m̃₂ = reduce_lanes(max,m̃₁,Val(4)),reduce_lanes(max,m̃₂,Val(4))
+            mⁿᵉʷ₁,mⁿᵉʷ₂ = max(m₁,m̃₁),max(m₂,m̃₂)
+            safe₁,safe₂ = isfinite(mⁿᵉʷ₁) ? mⁿᵉʷ₁ : 0f0, isfinite(mⁿᵉʷ₂) ? mⁿᵉʷ₂ : 0f0
+            α₁,α₂ = exp₂(m₁-safe₁),exp₂(m₂-safe₂)
+            ℓ̃₁,ℓ̃₂ = 0f0,0f0
+            @fragment for n in 1:$(Bᶜ÷8)
+                S[1,n] = exp₂(S[1,n]-safe₁)
+                S[2,n] = exp₂(S[2,n]-safe₁)
+                S[3,n] = exp₂(S[3,n]-safe₂)
+                S[4,n] = exp₂(S[4,n]-safe₂)
+                ℓ̃₁ += S[1,n]+S[2,n]
+                ℓ̃₂ += S[3,n]+S[4,n]
+            end
+            ℓ₁,ℓ₂ = α₁*ℓ₁+reduce_lanes(+,ℓ̃₁,Val(4)),α₂*ℓ₂+reduce_lanes(+,ℓ̃₂,Val(4))
+            m₁,m₂ = mⁿᵉʷ₁,mⁿᵉʷ₂
+            @fragment for d in 1:$(D÷8)
+                𝕆[1,d] *= α₁
+                𝕆[2,d] *= α₁
+                𝕆[3,d] *= α₂
+                𝕆[4,d] *= α₂
+            end
+
+            # Adjacent score fragments already have the next A operand's layout.
+            @fragment for k in 1:$(Bᶜ÷16)
+                P = (pack(S[1,2k-1],S[2,2k-1]),pack(S[3,2k-1],S[4,2k-1]),
+                     pack(S[1,2k],S[2,2k]),pack(S[3,2k],S[4,2k]))
+                for d in 1:$(D÷8)
+                    B = value_matrix(Vⱼ,16(k-1),8(d-1),lane)
+                    𝕆[:,d] = muladd(P,B,Fragment{(4,)}(𝕆[:,d]))
+                end
+            end
+            sync_threads()
+        end
+
+        @fragment for d in 1:$(D÷8), r in 1:4
+            channel = 8(d-1)+2part+mod(r-1,2)+1
+            row = query+8*((r-1)÷2)
+            if row <= T
+                @inbounds O[channel,head,row,document] = 𝕆[r,d] / (r <= 2 ? ℓ₁ : ℓ₂)
+            end
+        end
+        if part == 0
+            if query <= T
+                @inbounds ℓ[1,query,head,document] = ℓ₁
+                @inbounds m[1,query,head,document] = m₁*$(Float32(log(2)))
+            end
+            if query+8 <= T
+                @inbounds ℓ[1,query+8,head,document] = ℓ₂
+                @inbounds m[1,query+8,head,document] = m₂*$(Float32(log(2)))
+            end
+        end
+        nothing
+    end
+end
+
+"""
+    Δattention!(::TensorCoreInstruction,dQ,dK,dV,dO,Q,K,V,O,ℓ,m,window;
+                query_tile=256,key_tile=256)
+
+Correctness-first, tiled mixed-precision attention backward. Q/K/V are Float16;
+all other arrays are Float32. Inputs use channel × head × token × batch layout;
+ℓ,m have shape (1,T,H,B), with m in natural-log units as returned by the forward.
+Accumulates into dQ/dK/dV without clearing them. Supports GQA, ragged sequences,
+causal (-1,0), and nonnegative local window extents. All arrays must be on the
+active GPU with compatible shapes; gradient outputs must not alias the inputs.
+
+Uses conventional analytic softmax-backward equations on the rounded Q/K/V,
+not the literal derivative of Float16 quantization. Forward rounds each tile's
+unnormalized probabilities before P·V. Saved final ℓ,m do not recover those
+exact rounded weights: this pass reconstructs Float32 P and uses Δ=sum(dO.*O)
+from the saved Float32 output. Expect small mixed-precision differences versus
+ideal attention, not exact finite-difference agreement across quantization.
+
+Q/K/V conversion stays on the GPU and is limited to reusable tile buffers.
+There is no saved T×T matrix; scratch is O(query_tile*key_tile +
+D*(query_tile+key_tile)), independent of the number of heads and documents.
+FP32 `mul!` follows the caller's CUDA math mode; use the default/pedantic mode
+for correctness comparisons rather than enabling reduced-precision TF32 math.
+"""
+function Δattention!(::TensorCoreInstruction,
+    dQ::CuArray{Float32,4}, dK::CuArray{Float32,4}, dV::CuArray{Float32,4},
+    dO::CuArray{Float32,4},
+    Q::CuArray{Float16,4}, K::CuArray{Float16,4}, V::CuArray{Float16,4},
+    O::CuArray{Float32,4}, ℓ::CuArray{Float32,4}, m::CuArray{Float32,4},
+    window::Tuple{Int,Int}; query_tile::Int=256, key_tile::Int=256,
+)
+    D,H,T,B = size(Q)
+    Bᵣ,Bᶜ = min(T,query_tile),min(T,key_tile)
+    heads_per_kv = H÷size(K,2)
+    left,right = window
+    τ = inv(sqrt(Float32(D)))
+
+    Q₃₂ = similar(dO,D,Bᵣ)
+    K₃₂,V₃₂ = ntuple(_ -> similar(dO,D,Bᶜ),2)
+    S,dP = ntuple(_ -> similar(dO,Bᶜ,Bᵣ),2)
+    M = similar(dO,Bool,Bᶜ,Bᵣ)
+    dOO = similar(dO,D,Bᵣ)
+    Δ = similar(dO,1,Bᵣ)
+
+    for document in 1:B, head in 1:H, i in 1:cld(T,Bᵣ)
+        kv_head = cld(head,heads_per_kv)
+        blockᵢ = (i-1)*Bᵣ+1:min(i*Bᵣ,T)
+        nᵢ = length(blockᵢ)
+        @views begin
+            Qᵢ = Q₃₂[:,1:nᵢ]
+            Qᵢ .= Q[:,head,blockᵢ,document]
+            dQᵢ = dQ[:,head,blockᵢ,document]
+            dOᵢ = dO[:,head,blockᵢ,document]
+            Oᵢ = O[:,head,blockᵢ,document]
+            ℓᵢ = ℓ[:,blockᵢ,head,document]
+            mᵢ = m[:,blockᵢ,head,document]
+            dOOᵢ = dOO[:,1:nᵢ]
+            Δᵢ = Δ[:,1:nᵢ]
+        end
+        @. dOOᵢ = dOᵢ*Oᵢ
+        sum!(Δᵢ,dOOᵢ)
+
+        first_key = window == (-1,0) ? 1 : max(1,first(blockᵢ)-left)
+        last_key = min(T,last(blockᵢ)+right)
+        for j in cld(first_key,Bᶜ):cld(last_key,Bᶜ)
+            blockⱼ = (j-1)*Bᶜ+1:min(j*Bᶜ,T)
+            nⱼ = length(blockⱼ)
+            @views begin
+                Kⱼ,Vⱼ = K₃₂[:,1:nⱼ],V₃₂[:,1:nⱼ]
+                Kⱼ .= K[:,kv_head,blockⱼ,document]
+                Vⱼ .= V[:,kv_head,blockⱼ,document]
+                dKⱼ = dK[:,kv_head,blockⱼ,document]
+                dVⱼ = dV[:,kv_head,blockⱼ,document]
+                Sᵢⱼ = S[1:nⱼ,1:nᵢ]
+                dPᵢⱼ = dP[1:nⱼ,1:nᵢ]
+                Mᵢⱼ = M[1:nⱼ,1:nᵢ]
+            end
+
+            mul!(Sᵢⱼ,Kⱼ',Qᵢ,τ,0f0)
+            attention_mask!(Mᵢⱼ,blockⱼ,blockᵢ,window)
+            @. Sᵢⱼ = ifelse(Mᵢⱼ,Sᵢⱼ,-Inf32)
+            @. Sᵢⱼ = exp(Sᵢⱼ-mᵢ)/ℓᵢ
+            Pᵢⱼ = Sᵢⱼ
+
+            mul!(dVⱼ,dOᵢ,Pᵢⱼ',1f0,1f0)
+            mul!(dPᵢⱼ,Vⱼ',dOᵢ)
+            @. dPᵢⱼ = Pᵢⱼ*(dPᵢⱼ-Δᵢ)
+            dSᵢⱼ = dPᵢⱼ
+            mul!(dQᵢ,Kⱼ,dSᵢⱼ,τ,1f0)
+            mul!(dKⱼ,Qᵢ,dSᵢⱼ',τ,1f0)
+        end
+    end
+    nothing
 end
 
 end # module FemtoChatCUDAExt
