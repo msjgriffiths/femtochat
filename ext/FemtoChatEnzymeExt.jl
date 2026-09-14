@@ -4,7 +4,7 @@ using Enzyme
 using FemtoChat
 
 import FemtoChat: loss_and_gradient!
-import FemtoChat.Kernels: attention, flash_attention₁!, Δflash_attention₁!
+import FemtoChat.Kernels: attention, attention_state, Δattention!
 using FemtoChat.Parameters: Params, GPTConfig, 🤖
 
 Enzyme.Duplicated(params::Params) =
@@ -27,20 +27,18 @@ function Enzyme.EnzymeRules.augmented_primal(
     AK<:AbstractArray{F,4},
     AV<:AbstractArray{F,4},
 }
-    _, H, N, B = size(Q.val)
-    O = similar(Q.val)
-    dO = similar(Q.val)
-    ℓ = similar(Q.val, 1, N, H, B)
-    m = similar(Q.val, 1, N, H, B)
-    fill!(dO, zero(F))
+    saved = attention_state(attention, Q.val, K.val, V.val, window.val)
+    dO = similar(saved.O)
+    fill!(dO, zero(eltype(dO)))
 
-    flash_attention₁!(O, ℓ, m, Q.val, K.val, V.val, window.val)
-
-    pQ = Enzyme.EnzymeRules.overwritten(config)[2] ? copy(Q.val) : Q.val
-    pK = Enzyme.EnzymeRules.overwritten(config)[3] ? copy(K.val) : K.val
-    pV = Enzyme.EnzymeRules.overwritten(config)[4] ? copy(V.val) : V.val
-    primal = Enzyme.EnzymeRules.needs_primal(config) ? O : nothing
-    tape = (; pQ, pK, pV, O, dO, ℓ, m)
+    # Device dispatch may already have made separate, rounded forward inputs.
+    overwritten = Enzyme.EnzymeRules.overwritten(config)
+    pQ = overwritten[2] && Base.mightalias(saved.Q, Q.val) ? copy(saved.Q) : saved.Q
+    pK = overwritten[3] && Base.mightalias(saved.K, K.val) ? copy(saved.K) : saved.K
+    pV = overwritten[4] && Base.mightalias(saved.V, V.val) ? copy(saved.V) : saved.V
+    saved = (; saved..., Q=pQ, K=pK, V=pV)
+    primal = Enzyme.EnzymeRules.needs_primal(config) ? saved.O : nothing
+    tape = (; saved, dO)
 
     return Enzyme.EnzymeRules.AugmentedReturn(primal, dO, tape)
 end
@@ -55,18 +53,19 @@ function Enzyme.EnzymeRules.reverse(
     V::Enzyme.Duplicated,
     window::Enzyme.Const{Tuple{Int,Int}},
 )
-    (; pQ, pK, pV, O, dO, ℓ, m) = tape
-    Δflash_attention₁!(
+    (; saved, dO) = tape
+    Δattention!(
+        saved.𝒜,
         Q.dval,
         K.dval,
         V.dval,
         dO,
-        pQ,
-        pK,
-        pV,
-        O,
-        ℓ,
-        m,
+        saved.Q,
+        saved.K,
+        saved.V,
+        saved.O,
+        saved.ℓ,
+        saved.m,
         window.val,
     )
 

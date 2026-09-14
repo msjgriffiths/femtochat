@@ -12,7 +12,7 @@ import FemtoChat.GPT: apply_rotary_embedding,
                       norm,
                       smear,
                       smear_input
-import FemtoChat.Kernels: attention, flash_attention₁!, Δflash_attention₁!
+import FemtoChat.Kernels: attention, attention_state, Δattention!
 using FemtoChat.Parameters: Embedding, GPTConfig, Linear, Params, paramview, 🤖
 using Mooncake: CoDual,
                 MinimalCtx,
@@ -357,7 +357,7 @@ end
 } where {T<:AbstractFloat}
 
 function Mooncake.rrule!!(
-    ::CoDual{typeof(attention)},
+    f::CoDual{typeof(attention)},
     Q::CoDual{<:CuArray{T,4},<:CuArray{T,4}},
     K::CoDual{<:CuArray{T,4},<:CuArray{T,4}},
     V::CoDual{<:CuArray{T,4},<:CuArray{T,4}},
@@ -368,26 +368,22 @@ function Mooncake.rrule!!(
     pV, dV = arrayify(V)
     pwindow = primal(window)
 
-    _, H, N, B = size(pQ)
-    O = similar(pQ)
-    ℓ = similar(pQ, 1, N, H, B)
-    m = similar(pQ, 1, N, H, B)
-    flash_attention₁!(O, ℓ, m, pQ, pK, pV, pwindow)
-
-    result = zero_fcodual(O)
+    saved = attention_state(primal(f),pQ,pK,pV,pwindow)
+    result = zero_fcodual(saved.O)
 
     function attention_pullback(::NoRData)
-        Δflash_attention₁!(
+        Δattention!(
+            saved.𝒜,
             dQ,
             dK,
             dV,
             tangent(result),
-            pQ,
-            pK,
-            pV,
-            O,
-            ℓ,
-            m,
+            saved.Q,
+            saved.K,
+            saved.V,
+            saved.O,
+            saved.ℓ,
+            saved.m,
             pwindow,
         )
         return NoRData(), NoRData(), NoRData(), NoRData(), NoRData()
