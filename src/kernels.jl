@@ -379,7 +379,7 @@ Source: https://arxiv.org/abs/2307.08691
            𝐏̃ᵢ⁽ʲ⁾ = exp(𝐒ᵢ⁽ʲ⁾ − mᵢ⁽ʲ⁾) ∈ ℝᴮʳˣᴮᶜ pointwise,
            ℓᵢ⁽ʲ⁾ = eᵐⁱ⁽ʲ⁻¹⁾⁻ᵐⁱ⁽ʲ⁾ ℓᵢ⁽ʲ⁻¹⁾ + rowsum(𝐏̃ᵢ⁽ʲ⁾) ∈ ℝᴮʳ.
 10:        On chip, compute
-           𝐎ᵢ⁽ʲ⁾ = diag(eᵐⁱ⁽ʲ⁻¹⁾⁻ᵐⁱ⁽ʲ⁾)⁻¹ 𝐎ᵢ⁽ʲ⁻¹⁾ + 𝐏̃ᵢ⁽ʲ⁾𝐕ⱼ.
+           𝐎ᵢ⁽ʲ⁾ = diag(eᵐⁱ⁽ʲ⁻¹⁾⁻ᵐⁱ⁽ʲ⁾) 𝐎ᵢ⁽ʲ⁻¹⁾ + 𝐏̃ᵢ⁽ʲ⁾𝐕ⱼ.
 11:    𝐞𝐧𝐝 𝐟𝐨𝐫
 12:    On chip, compute 𝐎ᵢ = diag(ℓᵢ⁽ᵀᶜ⁾)⁻¹𝐎ᵢ⁽ᵀᶜ⁾.
 13:    On chip, compute Lᵢ = mᵢ⁽ᵀᶜ⁾ + log(ℓᵢ⁽ᵀᶜ⁾).
@@ -389,11 +389,25 @@ Source: https://arxiv.org/abs/2307.08691
 17: Return the output 𝐎 and the logsumexp 𝐋.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
-function flash_attention₂(Q::AbstractArray{F,4}, K::AbstractArray{F,4}, V::AbstractArray{F,4}, window) where F
-
-end
+function flash_attention₂ end
 
 attention(Q, K, V, window) = flash_attention₁(Q, K, V, window)
+
+attention!(::typeof(attention), args...; kwargs...) = flash_attention₁!(args...; kwargs...)
+Δattention!(::typeof(attention), args...; kwargs...) = Δflash_attention₁!(args...; kwargs...)
+
+accumulator_type(𝒜, ::Type{F}) where F = F
+attention_inputs(𝒜, Q, K, V) = (Q, K, V)
+
+function attention_state(𝒜, Q, K, V, window; kwargs...)
+    _, H, T, B = size(Q)
+    O = similar(Q)
+    F = accumulator_type(𝒜, eltype(Q))
+    ℓ, m = ntuple(_ -> similar(O, F, 1, T, H, B), 2)
+    Q, K, V = attention_inputs(𝒜, Q, K, V)
+    attention!(𝒜, O, ℓ, m, Q, K, V, window; kwargs...)
+    return (; 𝒜, Q, K, V, O, ℓ, m)
+end
 
 # function attention(Q::CuMatrix, K::CuMatrix, V::CuMatrix, window)
 #     # TODO: FA2 or FA3
