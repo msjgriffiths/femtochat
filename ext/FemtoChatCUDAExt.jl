@@ -167,39 +167,29 @@ Base.eltype(::Type{<:Tile{Shape,T}}) where {Shape,T} = T
 Base.Tuple(S::Tile) = S.values
 Base.iterate(S::Tile, state...) = iterate(S.values, state...)
 
-# A slice is an ordinary tuple, so reductions and broadcasts use ordinary Julia.
-# It is a snapshot, not a view. Use one integer or ':' per dimension.
-function coordinates(Shape, I)
-    length(Shape) == length(I) || error("use one index per tile dimension")
-    ranges = ntuple(d -> I[d] <: Colon ? (1:Shape[d]) : (1:1), length(Shape))
-    positions = CartesianIndices(ranges)
-    coordinates = [ntuple(d -> I[d] <: Colon ? p[d] : :(I[$d]), length(Shape)) for p in positions]
-    vec(coordinates)
-end
+# Slices are tuple snapshots. Integer axes have length one in the slice.
+@inline slice_shape(Shape,I) = map((n,i)->i isa Colon ? n : 1,Shape,I)
 
-function linear_index(Shape, coordinate)
-    terms = [:(($(coordinate[d]) - 1) * $(prod(Shape[1:d-1]))) for d in eachindex(Shape)]
-    :(1 + $(Expr(:call, :+, terms...)))
-end
-
-@inline @generated function Base.getindex(S::Tile{Shape}, I::Vararg{Union{Integer,Colon},N}) where {Shape,N}
-    values = [:(S.values[$(linear_index(Shape,c))]) for c in coordinates(Shape,I)]
-    result = any(t -> t <: Colon, I) ? Expr(:tuple,values...) : only(values)
-    :(@inbounds $result)
-end
-
-# Rebuild a tuple with the requested scalar/slice replaced. Static indices allow
-# the compiler to discard all the unchanged tuple copies.
-@inline @generated function replaced(S::Tile{Shape,T}, x, I::Vararg{Union{Integer,Colon},N}) where {Shape,T,N}
-    axes = findall(t -> t <: Colon,I)
-    sliced = LinearIndices(Tuple(Shape[d] for d in axes))
-    values = map(enumerate(CartesianIndices(Shape))) do (i,c)
-        conditions = [:($(c[d]) == I[$d]) for d in eachindex(Shape) if d ∉ axes]
-        selected = foldl((a,b)->:($a && $b),conditions;init=true)
-        value = isempty(axes) ? :x : :(x[$(sliced[Tuple(c[d] for d in axes)...])])
-        :(ifelse($selected, convert(T,$value), S.values[$i]))
+@inline function Base.getindex(S::Tile{Shape},I::Vararg{Union{Integer,Colon},N}) where {Shape,N}
+    length(Shape) == N || error("use one index per tile dimension")
+    dimensions = slice_shape(Shape,I)
+    values = ntuple(Val(prod(dimensions))) do j
+        position = Tuple(CartesianIndices(dimensions)[j])
+        coordinate = map((i,p)->i isa Colon ? p : i,I,position)
+        @inbounds S.values[LinearIndices(Shape)[coordinate...]]
     end
-    :(@inbounds $(Expr(:tuple,vec(values)...)))
+    any(i->i isa Colon,I) ? values : only(values)
+end
+
+@inline function replaced(S::Tile{Shape,T,N},x,I::Vararg{Union{Integer,Colon},M}) where {Shape,T,N,M}
+    dimensions = slice_shape(Shape,I)
+    ntuple(Val(N)) do j
+        coordinate = Tuple(CartesianIndices(Shape)[j])
+        selected = all(map((i,c)->i isa Colon || i == c,I,coordinate))
+        position = map((i,c)->i isa Colon ? c : 1,I,coordinate)
+        value = any(i->i isa Colon,I) ? x[LinearIndices(dimensions)[position...]] : x
+        ifelse(selected,convert(T,value),S.values[j])
+    end
 end
 
 @inline Base.setindex(S::Tile{Shape}, x, I...) where Shape =
@@ -869,19 +859,7 @@ end
 # Four raw words: eight 16-bit values moved without numeric conversion.
 const Word4 = NTuple{4,VecElement{Int32}}
 
-# Local copy operations, distinct from Base's whole-array copy!.
 function copy! end
-@inline function copy!(destination,source,channel,row,head,token,document)
-    @inbounds begin
-        index = LinearIndices(source)[channel,head,token,document]
-        input = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},pointer(source,index))
-        value = token <= size(source,3) ? CUDA.unsafe_cached_load(input,1,Val(16)) :
-            ntuple(_ -> VecElement(Int32(0)),Val(4))
-        output = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Shared},shared_pointer(destination,channel,row))
-        unsafe_store!(output,value,1,Val(16))
-    end
-    nothing
-end
 
 # Packed operands retain their numeric format across word loads and slices.
 struct Packed{F,N}
@@ -902,33 +880,34 @@ Base.Tuple(A::Packed) = A.words
 # ldmatrix consumes a 32-bit byte address in the shared-memory address space.
 @inline shared_address(A,row,column) = reinterpret(UInt,shared_pointer(A,row,column)) % UInt32
 
-# Return Julia's tuple representation directly: a C-ABI struct return introduces
-# out-of-line calls in the full attention kernel.
-function return_tuple!(builder,values,result_type,N)
-    result = LLVM.UndefValue(result_type)
-    for i in 0:N-1
-        result = LLVM.insert_value!(builder,result,LLVM.extract_value!(builder,values,i),i)
-    end
-    LLVM.ret!(builder,result)
-end
-
-@inline @generated function load_matrix(address::UInt32, ::Val{N}, ::Val{Transpose}) where {N,Transpose}
+# Convergent native instructions return an LLVM struct; bridge it explicitly to
+# Julia's tuple representation so whole kernels do not acquire C-ABI helper calls.
+function tuple_intrinsic(prepare,name,Return,Arguments,input_types,argument_values...)
     LLVM.Context() do _
-        result_type = convert(LLVM.LLVMType,NTuple{N,UInt32})
-        pointer_type = LLVM.PointerType(LLVM.Int8Type(),3)
-        f,_ = create_function(result_type,[LLVM.Int32Type()])
-        signature = LLVM.FunctionType(LLVM.StructType(fill(LLVM.Int32Type(),N)),[pointer_type])
-        name = "llvm.nvvm.ldmatrix.sync.aligned.m8n8.x$N$(Transpose ? ".trans" : "").b16.p3"
+        result_type = convert(LLVM.LLVMType,Return)
+        f,_ = create_function(result_type,[convert(LLVM.LLVMType,T) for T in Arguments])
+        signature = LLVM.FunctionType(LLVM.StructType([convert(LLVM.LLVMType,T) for T in Return.parameters]),input_types())
         instruction = LLVM.Function(LLVM.parent(f),name,signature)
         push!(LLVM.function_attributes(instruction),LLVM.EnumAttribute("convergent"))
         LLVM.IRBuilder() do builder
             LLVM.position!(builder,LLVM.BasicBlock(f,"entry"))
-            pointer = LLVM.inttoptr!(builder,only(LLVM.parameters(f)),pointer_type)
-            values = LLVM.call!(builder,signature,instruction,[pointer])
+            values = LLVM.call!(builder,signature,instruction,prepare(builder,LLVM.parameters(f)))
             push!(LLVM.function_attributes(values),LLVM.EnumAttribute("convergent"))
-            return_tuple!(builder,values,result_type,N)
+            result = LLVM.UndefValue(result_type)
+            for i in 0:fieldcount(Return)-1
+                result = LLVM.insert_value!(builder,result,LLVM.extract_value!(builder,values,i),i)
+            end
+            LLVM.ret!(builder,result)
         end
-        call_function(f,NTuple{N,UInt32},Tuple{UInt32},:address)
+        call_function(f,Return,Tuple{Arguments...},argument_values...)
+    end
+end
+
+@inline @generated function load_matrix(address::UInt32,::Val{N},::Val{Transpose}) where {N,Transpose}
+    name = "llvm.nvvm.ldmatrix.sync.aligned.m8n8.x$N$(Transpose ? ".trans" : "").b16.p3"
+    # Types are created within the builder's LLVM context, not at runtime.
+    tuple_intrinsic(name,NTuple{N,UInt32},(UInt32,),() -> [LLVM.PointerType(LLVM.Int8Type(),3)],:address) do builder,args
+        [LLVM.inttoptr!(builder,only(args),LLVM.PointerType(LLVM.Int8Type(),3))]
     end
 end
 
@@ -943,34 +922,17 @@ end
 @inline value_matrix(V,k₀,d₀,lane) = load_matrix(eltype(V),
     shared_address(V,d₀+1,k₀+lane%16+1),Val(2),Val(true))
 
-# NVIDIA m16n8k16: packed 16-bit inputs and four FP32 accumulators per lane.
-# LLVM18 needs the explicit convergent attribute before NVPTX lowering.
-# Packed operands keep this Base extension local to our notation.
-mma_operand(::Type{Float16}) = (LLVM.VectorType(LLVM.HalfType(),2),"f32.f32")
-mma_operand(::Type{BFloat16}) = (LLVM.Int32Type(),"bf16")
-
-@inline @generated function Base.muladd(A::Packed{F,4}, B::Packed{F,2}, C::NTuple{4,Float32}) where {F<:TensorFloat}
-    LLVM.Context() do _
-        result_type = convert(LLVM.LLVMType,NTuple{4,Float32})
-        argument_types = [convert(LLVM.LLVMType,T) for T in (NTuple{4,UInt32},NTuple{2,UInt32},NTuple{4,Float32})]
-        f,_ = create_function(result_type,argument_types)
-        operand,suffix = mma_operand(F)
-        MMA = LLVM.FunctionType(LLVM.StructType(fill(LLVM.FloatType(),4)),
-            [fill(operand,6);fill(LLVM.FloatType(),4)])
-        instruction = LLVM.Function(LLVM.parent(f),"llvm.nvvm.mma.m16n8k16.row.col.$suffix",MMA)
-        push!(LLVM.function_attributes(instruction),LLVM.EnumAttribute("convergent"))
-        LLVM.IRBuilder() do builder
-            LLVM.position!(builder,LLVM.BasicBlock(f,"entry"))
-            a,b,c = LLVM.parameters(f)
-            packed = [LLVM.extract_value!(builder,x,i) for x in (a,b) for i in 0:(x === a ? 3 : 1)]
-            inputs = LLVM.Value[LLVM.bitcast!(builder,x,operand) for x in packed]
-            append!(inputs,[LLVM.extract_value!(builder,c,i) for i in 0:3])
-            product = LLVM.call!(builder,MMA,instruction,inputs)
-            push!(LLVM.function_attributes(product),LLVM.EnumAttribute("convergent"))
-            return_tuple!(builder,product,result_type,4)
-        end
-        call_function(f,NTuple{4,Float32},Tuple{NTuple{4,UInt32},NTuple{2,UInt32},NTuple{4,Float32}},
-                      :(Tuple(A)),:(Tuple(B)),:C)
+# NVIDIA m16n8k16: four FP32 accumulators; packed operands retain input format.
+@inline @generated function Base.muladd(A::Packed{F,4},B::Packed{F,2},C::NTuple{4,Float32}) where {F<:TensorFloat}
+    suffix = F == Float16 ? "f32.f32" : "bf16"
+    tuple_intrinsic("llvm.nvvm.mma.m16n8k16.row.col.$suffix",NTuple{4,Float32},
+        (NTuple{4,UInt32},NTuple{2,UInt32},NTuple{4,Float32}),
+        () -> [fill(F == Float16 ? LLVM.VectorType(LLVM.HalfType(),2) : LLVM.Int32Type(),6);fill(LLVM.FloatType(),4)],
+        :(Tuple(A)),:(Tuple(B)),:C) do builder,args
+        a,b,c = args
+        operand = F == Float16 ? LLVM.VectorType(LLVM.HalfType(),2) : LLVM.Int32Type()
+        packed = [LLVM.bitcast!(builder,LLVM.extract_value!(builder,x,i),operand) for x in (a,b) for i in 0:(x === a ? 3 : 1)]
+        LLVM.Value[packed;[LLVM.extract_value!(builder,c,i) for i in 0:3]]
     end
 end
 
@@ -991,21 +953,6 @@ end
 # query-row × key-channel A tile used by the fifth tensor multiply.
 @inline transposed_query_matrix(A,q₀,k₀,lane) = load_matrix(eltype(A),
     shared_address(A,q₀+8*((lane÷8)%2)+1,k₀+8*(lane÷16)+lane%8+1),Val(4),Val(true))
-
-@inline function copy_async!(destination,source,channel,row,head,token,document)
-    @inbounds begin
-        output = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Shared},
-            shared_pointer(destination,channel,row))
-        if token <= size(source,3)
-            index = LinearIndices(source)[channel,head,token,document]
-            input = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},pointer(source,index))
-            CUDA.CG.pipeline_memcpy_async(output,input)
-        else
-            unsafe_store!(output,ntuple(_ -> VecElement(Int32(0)),Val(4)),1,Val(16))
-        end
-    end
-    nothing
-end
 
 @inline commit_copies!() = CUDA.CG.pipeline_commit()
 
@@ -1055,23 +1002,50 @@ struct WordSwizzle{Width,Mask} end
 @inline value_matrices(V::Swizzled,k₀,d₀,lane) = load_matrix(eltype(V),
     shared_address(V,d₀+8*(lane÷16)+1,k₀+lane%16+1),Val(4),Val(true))
 
-@inline function copy_rows!(copy!,destination,source,head,token₀,document,
-    ::Val{D},::Val{Rows},::Val{W},
-) where {D,Rows,W}
-    thread = threadIdx().x
-    if (32W) % (D÷8) == 0
-        # A thread keeps its channel word while advancing through token rows.
-        # Both the row induction and the lane coordinates remain 32-bit.
-        channel = 8i32*((thread-1i32)%Int32(D÷8))+1i32
-        first_row = (thread-1i32)÷Int32(D÷8)+1i32
-        for row in first_row:Int32(32W÷(D÷8)):Int32(Rows)
-            copy!(destination,source,channel,row,head,token₀+row,document)
-        end
+# One word belongs to one thread. Synchronous copies interleave load/store;
+# asynchronous copies are committed and waited for by the owning algorithm.
+@inline function copy!(output::Core.LLVMPtr{Word4,CUDA.AS.Shared},input,valid)
+    zero = ntuple(_->VecElement(Int32(0)),Val(4))
+    value = valid ? CUDA.unsafe_cached_load(input,1,Val(16)) : zero
+    unsafe_store!(output,value,1,Val(16))
+    nothing
+end
+
+@inline function copy_async!(output::Core.LLVMPtr{Word4,CUDA.AS.Shared},input,valid)
+    if valid
+        CUDA.CG.pipeline_memcpy_async(output,input)
     else
-        # Preserve the original ownership for nondividing widths, e.g. D=48.
-        for index in thread:32W:(D÷8*Rows)
-            channel,row = 8i32*((index-1i32)%Int32(D÷8))+1i32,(index-1i32)÷Int32(D÷8)+1i32
-            copy!(destination,source,channel,row,head,token₀+row,document)
+        unsafe_store!(output,ntuple(_->VecElement(Int32(0)),Val(4)),1,Val(16))
+    end
+    nothing
+end
+
+# A copy owns matching matrix tuples. The layouts own their shared addresses;
+# all sources share (D,H,T,B), so channel/head/token/document offsets agree.
+@inline matrices(A) = (A,)
+@inline matrices(A::Tuple) = A
+
+@inline function copy_rows!(copy!::F,destination,source,head,token₀,document,
+    ::Val{D},::Val{Rows},::Val{W},
+) where {F,D,Rows,W}
+    destinations,sources = matrices(destination),matrices(source)
+    thread = threadIdx().x
+    first_source = first(sources)
+    T = size(first_source,3)%Int32
+    pitch = D*size(first_source,2)
+    base = @inbounds LinearIndices((D,Base.tail(size(first_source))...))[1,head,1,document]
+    @loopinfo unroll=false for step in 0i32:Int32(cld(D÷8*Rows,32W)-1)
+        index = thread+step*Int32(32W)
+        if D÷8*Rows % (32W) == 0 || index <= Int32(D÷8*Rows)
+            channel = 8i32*((index-1i32)%Int32(D÷8))+1i32
+            row = (index-1i32)÷Int32(D÷8)+1i32
+            global_index = base+(channel-1i32)+(token₀+row-1i32)*pitch
+            @loopinfo unroll=true for pair in 1:length(sources)
+                destination,source = destinations[pair],sources[pair]
+                output = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Shared},shared_pointer(destination,channel,row))
+                input = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},@inbounds pointer(source,global_index))
+                copy!(output,input,token₀+row<=T)
+            end
         end
     end
     nothing
@@ -1258,35 +1232,29 @@ end
                         S[r,n] = valid ? S[r,n]*τ : -Inf32
                     end
                 end
-                m̃₁,m̃₂ = -Inf32,-Inf32
-                for n in 1:$(C÷8)
-                    m̃₁ = max(m̃₁,S[1,n],S[2,n])
-                    m̃₂ = max(m̃₂,S[3,n],S[4,n])
-                end
-                m̃₁,m̃₂ = reduce_lanes(max,m̃₁,Val(4)),reduce_lanes(max,m̃₂,Val(4))
-                mⁿᵉʷ₁,mⁿᵉʷ₂ = max(𝕞[1,u],m̃₁),max(𝕞[2,u],m̃₂)
-                safe₁,safe₂ = isfinite(mⁿᵉʷ₁) ? mⁿᵉʷ₁ : 0f0,isfinite(mⁿᵉʷ₂) ? mⁿᵉʷ₂ : 0f0
-                α₁,α₂ = exp₂(𝕞[1,u]-safe₁),exp₂(𝕞[2,u]-safe₂)
-                ℓ̃₁,ℓ̃₂ = 0f0,0f0
-                for n in 1:$(C÷8)
-                    S[1,n] = exp₂(S[1,n]-safe₁)
-                    S[2,n] = exp₂(S[2,n]-safe₁)
-                    S[3,n] = exp₂(S[3,n]-safe₂)
-                    S[4,n] = exp₂(S[4,n]-safe₂)
-                    ℓ̃₁ += S[1,n]+S[2,n]
-                    ℓ̃₂ += S[3,n]+S[4,n]
-                end
-                # α is shared by the four lanes; their sums can stay local
-                # until the final normalization, rather than shuffling every tile.
-                𝕝[1,u] = α₁*𝕝[1,u]+ℓ̃₁
-                𝕝[2,u] = α₂*𝕝[2,u]+ℓ̃₂
-                𝕞[1,u] = mⁿᵉʷ₁
-                𝕞[2,u] = mⁿᵉʷ₂
-                for d in 1:$(D÷8)
-                    𝕆[1,d] *= α₁
-                    𝕆[2,d] *= α₁
-                    𝕆[3,d] *= α₂
-                    𝕆[4,d] *= α₂
+                for r in 1:2
+                    a,b = 2r-1,2r
+                    m̃ = -Inf32
+                    for n in 1:$(C÷8)
+                        m̃ = max(m̃,S[a,n],S[b,n])
+                    end
+                    m̃ = reduce_lanes(max,m̃,Val(4))
+                    mⁿᵉʷ = max(𝕞[r,u],m̃)
+                    safe = isfinite(mⁿᵉʷ) ? mⁿᵉʷ : 0f0
+                    α = exp₂(𝕞[r,u]-safe)
+                    ℓ̃ = 0f0
+                    for n in 1:$(C÷8)
+                        S[a,n] = exp₂(S[a,n]-safe)
+                        S[b,n] = exp₂(S[b,n]-safe)
+                        ℓ̃ += S[a,n]+S[b,n]
+                    end
+                    # Row sums stay local until final normalization.
+                    𝕝[r,u] = α*𝕝[r,u]+ℓ̃
+                    𝕞[r,u] = mⁿᵉʷ
+                    for d in 1:$(D÷8)
+                        𝕆[a,d] *= α
+                        𝕆[b,d] *= α
+                    end
                 end
                 # Finish the Float32 softmax phase before multiplying V.
                 # Two probabilities share each UInt32 register; S is now dead.
@@ -1346,93 +1314,6 @@ end
         nothing
     end
 end
-
-# Both paired sources have the same (D,H,T,B) shape, and both destinations
-# have the same padded pitch. Share the validity test and linear offsets.
-@inline function copy!(outputs::NTuple{2},inputs::NTuple{2},valid)
-    output1,output2 = outputs
-    input1,input2 = inputs
-    zero = ntuple(_ -> VecElement(Int32(0)),Val(4))
-    a = valid ? CUDA.unsafe_cached_load(input1,1,Val(16)) : zero
-    unsafe_store!(output1,a,1,Val(16))
-    b = valid ? CUDA.unsafe_cached_load(input2,1,Val(16)) : zero
-    unsafe_store!(output2,b,1,Val(16))
-    nothing
-end
-@inline function copy_async!(outputs::NTuple{2},inputs::NTuple{2},valid)
-    output1,output2 = outputs
-    input1,input2 = inputs
-    if valid
-        CUDA.CG.pipeline_memcpy_async(output1,input1)
-        CUDA.CG.pipeline_memcpy_async(output2,input2)
-    else
-        zero = ntuple(_ -> VecElement(Int32(0)),Val(4))
-        unsafe_store!(output1,zero,1,Val(16))
-        unsafe_store!(output2,zero,1,Val(16))
-    end
-    nothing
-end
-@inline function copy_rows!(copy!::F,destinations::NTuple{2},sources::NTuple{2},
-    shared_index,global_index,valid,
-) where F
-    destination1,destination2 = destinations
-    source1,source2 = sources
-    @inbounds begin
-        output1 = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Shared},pointer(destination1,shared_index))
-        output2 = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Shared},pointer(destination2,shared_index))
-        input1 = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},pointer(source1,global_index))
-        input2 = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},pointer(source2,global_index))
-        copy!((output1,output2),(input1,input2),valid)
-    end
-    nothing
-end
-
-# Only matrix-copy loops use this helper. Global indices stay Int64; signed
-# sequence coordinates and all matrix/statistics/barrier code remain unchanged.
-@inline function copy_rows!(copy!::F,destinations::NTuple{2},sources::NTuple{2},
-    head,token₀,document,::Val{D},::Val{Rows},::Val{W},
-) where {F,D,Rows,W}
-    destination1,destination2 = destinations
-    source1,source2 = sources
-    thread = threadIdx().x
-    T = size(source1,3)%Int32
-    global_pitch = D*size(source1,2)
-    # One runtime shape-derived base for both sources, even for query tails.
-    indices = LinearIndices((D,Base.tail(size(source1))...))
-    base = @inbounds indices[1,head,token₀+1i32,document]
-    if (32W) % (D÷8) == 0
-        channel = 8i32*((thread-1i32)%Int32(D÷8))+1i32
-        first_row = (thread-1i32)÷Int32(D÷8)+1i32
-        row_stride = Int32(32W÷(D÷8))
-        shared_first = channel+(first_row-1i32)*Int32(D+8)
-        global_first = base+(channel-1i32)+(first_row-1i32)*global_pitch
-        global_step = row_stride*global_pitch
-        @loopinfo unroll=true for step in 0i32:Int32(cld(D÷8*Rows,32W)-1)
-            row = first_row+step*row_stride
-            if D÷8*Rows % (32W) == 0 || row <= Int32(Rows)
-                shared_index = shared_first+step*Int32((32W÷(D÷8))*(D+8))
-                global_index = global_first+step*global_step
-                copy_rows!(copy!,destinations,sources,
-                    shared_index,global_index,token₀+row<=T)
-            end
-        end
-    else
-        # General widths keep the original per-thread linear-word order.
-        @loopinfo unroll=true for step in 0i32:Int32(cld(D÷8*Rows,32W)-1)
-            index = thread+step*Int32(32W)
-            if D÷8*Rows % (32W) == 0 || index <= Int32(D÷8*Rows)
-                channel = 8i32*((index-1i32)%Int32(D÷8))+1i32
-                row = (index-1i32)÷Int32(D÷8)+1i32
-                shared_index = channel+(row-1i32)*Int32(D+8)
-                global_index = base+(channel-1i32)+(row-1i32)*global_pitch
-                copy_rows!(copy!,destinations,sources,
-                    shared_index,global_index,token₀+row<=T)
-            end
-        end
-    end
-    nothing
-end
-
 
 # Unified gradient storage preparation and final stores.
 # The caller's value is added before its one final storage conversion.
