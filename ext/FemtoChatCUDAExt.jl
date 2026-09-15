@@ -205,11 +205,11 @@ end
 @inline Base.setindex(S::Tile{Shape}, x, I...) where Shape =
     Tile{Shape}(replaced(S,x,I...))
 
-# Tiles replace the binding; mutable containers retain it, even if the RHS rebinds it.
-Base.@propagate_inbounds assignindex!(A::Tile, binding, x, I::Vararg{Any,N}) where N = Base.setindex(A,x,I...)
-Base.@propagate_inbounds function assignindex!(A, binding, x, I::Vararg{Any,N}) where N
+# Mutating updates return nothing; Tile updates return a replacement.
+Base.@propagate_inbounds assignindex!(A::Tile, x, I::Vararg{Any,N}) where N = Base.setindex(A,x,I...)
+Base.@propagate_inbounds function assignindex!(A, x, I::Vararg{Any,N}) where N
     setindex!(A,x,I...)
-    binding
+    nothing
 end
 
 # Unroll literal loop bounds, leaving arithmetic and indexing to Julia.
@@ -238,7 +238,7 @@ function assignments(x)
         ref, rhs = x.args
         A, I = ref.args[1], ref.args[2:end]
         A isa Symbol || error("@tile assignment requires a local variable")
-        object, indices, value = gensym.((:object,:indices,:value))
+        object, indices, value, replacement = gensym.((:object,:indices,:value,:replacement))
         if x.head != :(=)
             op = Symbol(chop(string(x.head)))
             rhs = :($op(getindex($object,$indices...),$rhs))
@@ -247,7 +247,8 @@ function assignments(x)
             local $object = $A
             local $indices = ($(I...),)
             local $value = $rhs
-            $A = @inline $(GlobalRef(@__MODULE__,:assignindex!))($object,$A,$value,$indices...)
+            local $replacement = $(GlobalRef(@__MODULE__,:assignindex!))($object,$value,$indices...)
+            isnothing($replacement) || ($A = $replacement)
             $value
         end
     end
@@ -314,9 +315,14 @@ const Float32ᵛ{N} = NTuple{N,Base.VecElement{Float32}}
 
 # These aligned vector operations are only for contiguous global channels.
 # Strided shared-memory copies use ordinary views and copyto! in the kernel.
-@inline function load(::Type{Float32ᵛ{W}}, A::CuDeviceArray{Float32,N,CUDA.AS.Global}, index) where {W,N}
-    p = reinterpret(Core.LLVMPtr{Float32ᵛ{W},CUDA.AS.Global}, pointer(A, index))
-    return CUDA.unsafe_cached_load(p, 1, Val(sizeof(Float32)*W))
+@inline function load(::Type{NTuple{W,VecElement{F}}}, A::CuDeviceArray{T,N,CUDA.AS.Global}, index) where {F,W,T,N}
+    p = reinterpret(Core.LLVMPtr{NTuple{W,VecElement{F}},CUDA.AS.Global}, pointer(A,index))
+    return CUDA.unsafe_cached_load(p,1,Val(sizeof(F)*W))
+end
+
+@inline function load(::Type{NTuple{W,VecElement{F}}}, A::CuDeviceArray{T,N,CUDA.AS.Shared}, index) where {F,W,T,N}
+    p = reinterpret(Core.LLVMPtr{NTuple{W,VecElement{F}},CUDA.AS.Shared}, pointer(A,index))
+    return unsafe_load(p,1,Val(sizeof(F)*W))
 end
 
 # Width is the Q/K staging width or padded V pitch. Whole stages elide the
@@ -331,9 +337,9 @@ end
     end
 end
 
-@inline function store!(A::CuDeviceArray{Float32,N,CUDA.AS.Shared}, index, value::Float32ᵛ{W}) where {W,N}
-    p = reinterpret(Core.LLVMPtr{Float32ᵛ{W},CUDA.AS.Shared}, pointer(A, index))
-    unsafe_store!(p, value, 1, Val(sizeof(Float32)*W))
+@inline function store!(A::CuDeviceArray{T,N,AS}, index, value::NTuple{W,VecElement{F}}) where {T,N,AS,F,W}
+    p = reinterpret(Core.LLVMPtr{NTuple{W,VecElement{F}},AS}, pointer(A,index))
+    unsafe_store!(p,value,1,Val(sizeof(F)*W))
     return nothing
 end
 
@@ -862,7 +868,10 @@ end
 
 # Four raw words: eight 16-bit values moved without numeric conversion.
 const Word4 = NTuple{4,VecElement{Int32}}
-@inline function copy8!(destination,source,channel,row,head,token,document)
+
+# Local copy operations, distinct from Base's whole-array copy!.
+function copy! end
+@inline function copy!(destination,source,channel,row,head,token,document)
     @inbounds begin
         index = LinearIndices(source)[channel,head,token,document]
         input = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},pointer(source,index))
@@ -971,7 +980,7 @@ end
 const LOG₂E = Float32(log2(exp(1.0)))
 
 # dS stores two neighboring queries for one key in a single shared word.
-@inline function store_pair!(A,query,key,value::UInt32)
+@inline function store!(A,query,key,value::UInt32)
     @inbounds address = pointer(A,query+(key-1)*size(A,1))
     output = reinterpret(Core.LLVMPtr{UInt32,CUDA.AS.Shared},address)
     unsafe_store!(output,value,1,Val(4))
@@ -983,7 +992,7 @@ end
 @inline transposed_query_matrix(A,q₀,k₀,lane) = load_matrix(eltype(A),
     shared_address(A,q₀+8*((lane÷8)%2)+1,k₀+8*(lane÷16)+lane%8+1),Val(4),Val(true))
 
-@inline function copy8_async!(destination,source,channel,row,head,token,document)
+@inline function copy_async!(destination,source,channel,row,head,token,document)
     @inbounds begin
         output = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Shared},
             shared_pointer(destination,channel,row))
@@ -1186,7 +1195,7 @@ end
             Kⱼ = Swizzled(CuDynamicSharedArray(eltype(K),($D,$C),$(offsets.K)),Val(WordSwizzle{8,$mask}))
             Vⱼ = Swizzled(CuDynamicSharedArray(eltype(V),($D,$C),$(offsets.V)),Val(WordSwizzle{8,$mask}))
         end
-        copy_rows!(copy8!,Qᵢ,Q,head,blockᵢ,document,Val($D),Val($R),Val($W))
+        copy_rows!(copy!,Qᵢ,Q,head,blockᵢ,document,Val($D),Val($R),Val($W))
         sync_threads()
         𝕆₁ = Tile{(4,$(D÷8))}(0f0)
         𝕆₂ = 𝕆₁
@@ -1194,13 +1203,13 @@ end
         𝕝 = Tile{(2,2)}(0f0)
         first_key = $Window == (-1,0) ? 0i32 : max(0i32,blockᵢ-left)÷$(Int32(C))*$(Int32(C))
         last_key = min(T,blockᵢ+$(Int32(R))+right)
-        copy_rows!(copy8_async!,Kⱼ,K,kv_head,first_key,document,Val($D),Val($C),Val($W))
+        copy_rows!(copy_async!,Kⱼ,K,kv_head,first_key,document,Val($D),Val($C),Val($W))
         commit_copies!()
         for j in 0i32:cld(last_key-first_key,$(Int32(C)))-1i32
             blockⱼ = first_key+j*$(Int32(C))
             # Current K is ready; every reader of the previous V has retired.
             wait_copies!()
-            copy_rows!(copy8_async!,Vⱼ,V,kv_head,blockⱼ,document,Val($D),Val($C),Val($W))
+            copy_rows!(copy_async!,Vⱼ,V,kv_head,blockⱼ,document,Val($D),Val($C),Val($W))
             commit_copies!()
 
             # Both query halves consume the same K tile before it dies.
@@ -1227,7 +1236,7 @@ end
             # every K reader before the single K buffer receives its next tile.
             wait_copies!()
             if blockⱼ+$(Int32(C)) < last_key
-                copy_rows!(copy8_async!,Kⱼ,K,kv_head,blockⱼ+$(Int32(C)),document,Val($D),Val($C),Val($W))
+                copy_rows!(copy_async!,Kⱼ,K,kv_head,blockⱼ+$(Int32(C)),document,Val($D),Val($C),Val($W))
                 commit_copies!()
             end
             𝒫₁ = Tile{(4,$(C÷16))}(UInt32(0))
@@ -1340,7 +1349,9 @@ end
 
 # Both paired sources have the same (D,H,T,B) shape, and both destinations
 # have the same padded pitch. Share the validity test and linear offsets.
-@inline function copy_pair!(::typeof(copy8!),output1,output2,input1,input2,valid)
+@inline function copy!(outputs::NTuple{2},inputs::NTuple{2},valid)
+    output1,output2 = outputs
+    input1,input2 = inputs
     zero = ntuple(_ -> VecElement(Int32(0)),Val(4))
     a = valid ? CUDA.unsafe_cached_load(input1,1,Val(16)) : zero
     unsafe_store!(output1,a,1,Val(16))
@@ -1348,7 +1359,9 @@ end
     unsafe_store!(output2,b,1,Val(16))
     nothing
 end
-@inline function copy_pair!(::typeof(copy8_async!),output1,output2,input1,input2,valid)
+@inline function copy_async!(outputs::NTuple{2},inputs::NTuple{2},valid)
+    output1,output2 = outputs
+    input1,input2 = inputs
     if valid
         CUDA.CG.pipeline_memcpy_async(output1,input1)
         CUDA.CG.pipeline_memcpy_async(output2,input2)
@@ -1359,24 +1372,28 @@ end
     end
     nothing
 end
-@inline function copy_pair_offsets!(copy!::F,destination1,destination2,source1,source2,
+@inline function copy_rows!(copy!::F,destinations::NTuple{2},sources::NTuple{2},
     shared_index,global_index,valid,
 ) where F
+    destination1,destination2 = destinations
+    source1,source2 = sources
     @inbounds begin
         output1 = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Shared},pointer(destination1,shared_index))
         output2 = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Shared},pointer(destination2,shared_index))
         input1 = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},pointer(source1,global_index))
         input2 = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},pointer(source2,global_index))
-        copy_pair!(copy!,output1,output2,input1,input2,valid)
+        copy!((output1,output2),(input1,input2),valid)
     end
     nothing
 end
 
 # Only matrix-copy loops use this helper. Global indices stay Int64; signed
 # sequence coordinates and all matrix/statistics/barrier code remain unchanged.
-@inline function copy_paired_rows!(copy!::F,destination1,destination2,source1,source2,
+@inline function copy_rows!(copy!::F,destinations::NTuple{2},sources::NTuple{2},
     head,token₀,document,::Val{D},::Val{Rows},::Val{W},
 ) where {F,D,Rows,W}
+    destination1,destination2 = destinations
+    source1,source2 = sources
     thread = threadIdx().x
     T = size(source1,3)%Int32
     global_pitch = D*size(source1,2)
@@ -1395,7 +1412,7 @@ end
             if D÷8*Rows % (32W) == 0 || row <= Int32(Rows)
                 shared_index = shared_first+step*Int32((32W÷(D÷8))*(D+8))
                 global_index = global_first+step*global_step
-                copy_pair_offsets!(copy!,destination1,destination2,source1,source2,
+                copy_rows!(copy!,destinations,sources,
                     shared_index,global_index,token₀+row<=T)
             end
         end
@@ -1408,7 +1425,7 @@ end
                 row = (index-1i32)÷Int32(D÷8)+1i32
                 shared_index = channel+(row-1i32)*Int32(D+8)
                 global_index = base+(channel-1i32)+(row-1i32)*global_pitch
-                copy_pair_offsets!(copy!,destination1,destination2,source1,source2,
+                copy_rows!(copy!,destinations,sources,
                     shared_index,global_index,token₀+row<=T)
             end
         end
@@ -1428,19 +1445,9 @@ end
     nothing
 end
 
-@inline function store_vector!(destination,source,input_index,output_index)
-    @inbounds begin
-        input = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Shared},pointer(source,input_index))
-        output = reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},pointer(destination,output_index))
-        values = unsafe_load(input,1,Val(16))
-        unsafe_store!(output,values,1,Val(16))
-    end
-    nothing
-end
-
 # Both storage contracts share row statistics and padded scratch clearing.
 # Nothing means no conversion buffer and no scale; those branches disappear.
-function prepare_upstream!(dO₁₆,δQ,Δ,L,dO,O,ℓ,m,s,::Val{D}) where D
+function prepare_backward!(dO₁₆::Union{Nothing,CuDeviceArray},δQ,Δ,L,dO,O,ℓ,m,s,::Val{D}) where D
     lane,warp = (threadIdx().x-1i32)%32i32,(threadIdx().x-1i32)÷32i32
     i,head,document = blockIdx()
     query = (i-1i32)*(blockDim().x÷32i32)+warp+1i32
@@ -1471,16 +1478,17 @@ function prepare_upstream!(dO₁₆,δQ,Δ,L,dO,O,ℓ,m,s,::Val{D}) where D
     nothing
 end
 
-@inline function load8(A::CuDeviceArray{F,4},channel,head,query,document) where {F<:TensorFloat}
-    index=@inbounds LinearIndices(A)[channel,head,query,document]
-    pointer8=reinterpret(Core.LLVMPtr{Word4,CUDA.AS.Global},pointer(A,index))
-    CUDA.unsafe_cached_load(pointer8,1,Val(16))
+@inline function load(::Type{Packed{F,N}},A::CuDeviceArray,index::Integer) where {F<:TensorFloat,N}
+    words = load(NTuple{N,VecElement{Int32}},A,index)
+    Packed{F}(map(x->reinterpret(UInt32,x.value),words))
 end
+@inline load(T::Type{<:Packed},A::CuDeviceArray,index::Tuple) =
+    load(T,A,@inbounds LinearIndices(A)[index...])
 
 # Unpack the storage format; all products and accumulation use Float32.
-@inline function dot8(::Type{F},a::Word4,b::Word4,value::Float32=0f0) where {F<:TensorFloat}
-    @tile for word in 1:4
-        x,y=a[word].value,b[word].value
+@inline function dotadd(a::Packed{F,N},b::Packed{F,N},value::Float32=0f0) where {F<:TensorFloat,N}
+    @loopinfo unroll=true for word in 1:N
+        x,y=a[word],b[word]
         value=muladd(Float32(reinterpret(F,x%UInt16)),
             Float32(reinterpret(F,y%UInt16)),value)
         value=muladd(Float32(reinterpret(F,(x>>>16)%UInt16)),
@@ -1489,13 +1497,7 @@ end
     value
 end
 
-@inline function clear4!(scratch::CuDeviceArray{Float32,1},index)
-    destination=reinterpret(Core.LLVMPtr{Float32ᵛ{4},CUDA.AS.Global},pointer(scratch,index))
-    unsafe_store!(destination,ntuple(_->VecElement(0f0),Val(4)),1,Val(16))
-    nothing
-end
-
-@generated function prepare_vector!(δQ,Δ,L,dO,output,ℓ,m,::Val{D},::Val{Values},::Val{Rows}) where {D,Values,Rows}
+@generated function prepare_backward!(δQ::CuDeviceArray{Float32,1},Δ,L,dO,output,ℓ,m,::Val{D},::Val{Values},::Val{Rows}) where {D,Values,Rows}
     G=D÷Values
     quote
         thread=threadIdx().x-1i32
@@ -1510,16 +1512,18 @@ end
                 offset=$(Int32(D))*(query-1i32+padded*(head-1i32+H*(document-1i32)))
                 # Each instruction writes one contiguous row segment across the group.
                 @tile for segment in 0:$(Values÷4-1)
-                    clear4!(δQ,offset+4i32*lane+$(Int32(4G))*segment+1i32)
+                    store!(δQ,offset+4i32*lane+$(Int32(4G))*segment+1i32,
+                        (@ntuple 4 d->VecElement(0f0)))
                 end
             end
             value=0f0
             if query<=T
                 @tile for chunk in 0:$(Values÷8-1)
                     channel=8i32*lane+$(Int32(8G))*chunk+1i32
-                    a=load8(dO,channel,head,query,document)
-                    b=load8(output,channel,head,query,document)
-                    value=dot8(eltype(dO),a,b,value)
+                    index=(channel,head,query,document)
+                    a=load(Packed{eltype(dO),4},dO,index)
+                    b=load(Packed{eltype(output),4},output,index)
+                    value=dotadd(a,b,value)
                 end
             end
             # Padded/inactive groups also participate, so FULL_MASK remains valid.
@@ -1536,33 +1540,33 @@ end
 end
 
 
-function prepare!(::Type{F},δQ,Δ,L,dO::CuArray{F,4},O,ℓ,m,::Val{D},::Val{W}) where {F<:TensorFloat,D,W}
+function prepare_backward!(::Type{F},δQ,Δ,L,dO::CuArray{F,4},O,ℓ,m,::Val{D},::Val{W}) where {F<:TensorFloat,D,W}
     _,H,T,B = size(dO)
     if D in (64,128)
         # Eight lanes per row, two rows per subgroup:64 queries/256-thread CTA.
-        @cuda threads=256 blocks=(cld(16cld(T,16),64),H,B) prepare_vector!(
+        @cuda threads=256 blocks=(cld(16cld(T,16),64),H,B) prepare_backward!(
             δQ,Δ,L,dO,O,ℓ,m,Val(D),Val(D÷8),Val(2))
     else
-        @cuda threads=32W blocks=(cld(16cld(T,16),W),H,B) prepare_upstream!(
+        @cuda threads=32W blocks=(cld(16cld(T,16),W),H,B) prepare_backward!(
             nothing,δQ,Δ,L,dO,O,ℓ,m,nothing,Val(D))
     end
     dO,nothing
 end
 
-function prepare!(::Type{F},δQ,Δ,L,dO::CuArray{Float32,4},O,ℓ,m,::Val{D},::Val{W}) where {F<:TensorFloat,D,W}
+function prepare_backward!(::Type{F},δQ,Δ,L,dO::CuArray{Float32,4},O,ℓ,m,::Val{D},::Val{W}) where {F<:TensorFloat,D,W}
     _,H,T,B = size(dO)
     s = mapreduce(abs,max,vec(dO);dims=1)
     @. s = ifelse(iszero(s),1f0,exp2(clamp(floor(log2(32f0/s)),-120f0,120f0)))
     dO₁₆ = similar(dO,F)
-    @cuda threads=32W blocks=(cld(16cld(T,16),W),H,B) prepare_upstream!(
+    @cuda threads=32W blocks=(cld(16cld(T,16),W),H,B) prepare_backward!(
         dO₁₆,δQ,Δ,L,dO,O,ℓ,m,s,Val(D))
     dO₁₆,s
 end
 
 # Preserve the final rounding boundary while transposing the MMA scratch.
-@inline stage_pair!(S::CuDeviceArray{F},d,q,a,b) where {F<:TensorFloat} = store_pair!(S,d,q,pack(F,a,b))
-@inline function stage_pair!(S::CuDeviceArray{Float32},d,q,a,b)
-    @inbounds S[d,q],S[d+1,q] = a,b
+@inline store!(S::CuDeviceArray{F},d,q,values::NTuple{2,Float32}) where {F<:TensorFloat} = store!(S,d,q,pack(F,values...))
+@inline function store!(S::CuDeviceArray{Float32},d,q,values::NTuple{2,Float32})
+    @inbounds S[d,q],S[d+1,q] = values
     nothing
 end
 
@@ -1590,7 +1594,7 @@ function gather_query!(dQ::CuDeviceArray{F,4},partial,s,::Val{D},::Val{H},policy
                 x = gradient_value(dQ,index,x,policy)
                 y = gradient_value(dQ,index+1,y,policy)
             end
-            stage_pair!(S,channel,q,x,y)
+            store!(S,channel,q,(x,y))
         end
     end
     sync_threads()
@@ -1601,7 +1605,7 @@ function gather_query!(dQ::CuDeviceArray{F,4},partial,s,::Val{D},::Val{H},policy
         query = 16i32*tile+row
         if query<=T
             @inbounds output = LinearIndices(dQ)[channel,head,query,document]
-            store_vector!(dQ,S,channel+(row-1i32)*Int32(D+8),output)
+            store!(dQ,output,load(Word4,S,channel+(row-1i32)*Int32(D+8)))
         end
     end
     nothing
@@ -1770,7 +1774,7 @@ function launch_gradient!(dQ,dK,dV,dO,Q,K,V,O,ℓ,m,window,
     δK,δV = Span==groups ? (dK,dV) :
         ntuple(_ -> similar(dO,Float32,D,H÷Span,T,B),2)
     # Preparation and padded scratch clearing happen once, not per candidate.
-    dO₁₆,s = prepare!(eltype(Q),δQ,Δ,L,dO,O,ℓ,m,Val(D),Val(W))
+    dO₁₆,s = prepare_backward!(eltype(Q),δQ,Δ,L,dO,O,ℓ,m,Val(D),Val(W))
     common = (;dQ=δQ,dK=δK,dV=δV,Q,K,V,dO=dO₁₆,L,Δ,s,window=Val(window),D=Val(D))
     if Automatic
         select_and_launch!(common,Val(W),Val(C),Val(groups),Val(Span),policy,
@@ -1818,7 +1822,7 @@ end
             Lᵢ = CuDynamicSharedArray(Float32,$C,$(offsets.L))
             Δᵢ = CuDynamicSharedArray(Float32,$C,$(offsets.Δ))
         end
-        copy_paired_rows!(copy8!,Kⱼ,Vⱼ,K,V,kv_head,blockⱼ,document,Val($D),Val($R),Val($W))
+        copy_rows!(copy!,(Kⱼ,Vⱼ),(K,V),kv_head,blockⱼ,document,Val($D),Val($R),Val($W))
         sync_threads()
         Vᵣ = Tile{(4,$(D÷16))}(UInt32(0)) # V retained in registers, not a gradient.
         @tile for d in 1:$(D÷16)
@@ -1835,7 +1839,7 @@ end
         # Keep both gradients live across heads; prime each head's Q/dO tile.
         @loopinfo unroll=false for head in ((shard-1i32)*$(Int32(Span))+1i32):(shard*$(Int32(Span)))
             # Prime the first query tile after V's register capture has completed.
-            copy_paired_rows!(copy8_async!,Qᵢ,dOᵢ,Q,dO,head,first_query,document,Val($D),Val($C),Val($W))
+            copy_rows!(copy_async!,(Qᵢ,dOᵢ),(Q,dO),head,first_query,document,Val($D),Val($C),Val($W))
             commit_copies!()
             for row in thread:$(32W):$C
                 query = first_query+row
@@ -1856,8 +1860,8 @@ end
                         @tile for n in 1:2
                             row=16warp+lane_row+1
                             query=column+8(n-1)+2lane_pair+1
-                            store_pair!(dSᵢⱼ,query,row,UInt32(0))
-                            store_pair!(dSᵢⱼ,query,row+8,UInt32(0))
+                            store!(dSᵢⱼ,query,row,UInt32(0))
+                            store!(dSᵢⱼ,query,row+8,UInt32(0))
                         end
                     else
                         P = Tile{(4,2)}(0f0)
@@ -1902,8 +1906,8 @@ end
                         @tile for n in 1:2
                             row = 16warp+lane_row+1
                             query = column+8(n-1)+2lane_pair+1
-                            store_pair!(dSᵢⱼ,query,row,ds[2n-1])
-                            store_pair!(dSᵢⱼ,query,row+8,ds[2n])
+                            store!(dSᵢⱼ,query,row,ds[2n-1])
+                            store!(dSᵢⱼ,query,row+8,ds[2n])
                         end
                         @tile for d in 1:$(D÷8)
                             B = value_matrix(Qᵢ,column,8(d-1),lane)
@@ -1918,7 +1922,7 @@ end
                 # All current Q/dO reads are finished. Their next tile can arrive
                 # while dQ uses only resident K and the completed dS tile.
                 if blockᵢ+$(Int32(C)) < last_query
-                    copy_paired_rows!(copy8_async!,Qᵢ,dOᵢ,Q,dO,head,blockᵢ+$(Int32(C)),document,Val($D),Val($C),Val($W))
+                    copy_rows!(copy_async!,(Qᵢ,dOᵢ),(Q,dO),head,blockᵢ+$(Int32(C)),document,Val($D),Val($C),Val($W))
                     commit_copies!()
                     for row in thread:$(32W):$C
                         query = blockᵢ+$(Int32(C))+row
@@ -1992,8 +1996,8 @@ end
                     v₁ = gradient_value(dV,index,v₁,Val($Accumulate))
                     v₂ = gradient_value(dV,index+1,v₂,Val($Accumulate))
                 end
-                store_pair!(gradientK,channel,local_row,pack(eltype(dK),k₁,k₂))
-                store_pair!(gradientV,channel,local_row,pack(eltype(dV),v₁,v₂))
+                store!(gradientK,channel,local_row,pack(eltype(dK),k₁,k₂))
+                store!(gradientV,channel,local_row,pack(eltype(dV),v₁,v₂))
             end
             sync_threads()
             @tile for vector in 0:$(D÷16-1)
@@ -2002,8 +2006,8 @@ end
                 row = (index-1i32)÷$(Int32(D÷8))+1i32
                 if blockⱼ+row <= T
                     @inbounds output = LinearIndices(dK)[channel,kv_head,blockⱼ+row,document]
-                    store_vector!(dK,gradientK,8index-7i32,output)
-                    store_vector!(dV,gradientV,8index-7i32,output)
+                    store!(dK,output,load(Word4,gradientK,8index-7i32))
+                    store!(dV,output,load(Word4,gradientV,8index-7i32))
                 end
             end
         else
