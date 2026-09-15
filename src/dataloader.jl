@@ -9,6 +9,7 @@ using ..Tokenizer: bos_token_id
 export DataLoader,
        DataLoaderState,
        eachbatch,
+       batch_state,
        eachdocument,
        read_documents,
        tokenize_documents
@@ -42,19 +43,8 @@ function DataLoader(
     state::DataLoaderState = DataLoaderState(),
     connection = connect(DB, ":memory:"),
 )
-    world_size > 0 || throw(ArgumentError("world_size must be positive"))
-    0 <= rank < world_size ||
-        throw(ArgumentError("rank must satisfy 0 ≤ rank < world_size"))
-
     files = sort!(String.(files))
     files = files[rank+1:world_size:end]
-    isempty(files) && throw(ArgumentError("rank $rank has no assigned files"))
-
-    1 <= state.file <= length(files) ||
-        throw(ArgumentError("state.file is outside the assigned file list"))
-    state.row > 0 || throw(ArgumentError("state.row must be positive"))
-    state.epoch > 0 || throw(ArgumentError("state.epoch must be positive"))
-
     DataLoader(files, rank, world_size, state, connection)
 end
 
@@ -97,12 +87,13 @@ end
 """Tokenize a batch of documents and prepend BOS to each one."""
 function tokenize_documents(tokenizer, texts)
     bos = bos_token_id(tokenizer)
+    map(text -> tokenize_document(tokenizer, text, bos), texts)
+end
 
-    map(texts) do text
-        tokens = tokenizer(text)
-        pushfirst!(tokens, bos)
-        tokens
-    end
+function tokenize_document(tokenizer, text, bos)
+    tokens = tokenizer(text)
+    pushfirst!(tokens, bos)
+    tokens
 end
 
 struct DocumentIterator{L,T,I}
@@ -131,19 +122,150 @@ function model_batch(documents, sequence_len, bos)
     return tokens, targets
 end
 
-"""Iterate forever over model-ready batches of `k` documents."""
-function eachbatch(loader::DataLoader, tokenizer, k::Int, sequence_len::Int)
+mutable struct ActiveDocument{I}
+    source::DataLoaderState
+    tokens::Vector{I}
+    position::Int
+end
+
+mutable struct BatchIterator{L,T,I}
+    loader::L
+    tokenizer::T
+    bos::I
+    sequence_len::Int
+    slots::Vector{Union{Nothing,ActiveDocument{I}}}
+    document_rows::Any
+    row_state::Any
+    exhausted::Bool
+end
+
+"""
+Iterate over batches with at most one chunk from each document per batch.
+
+Returns `(tokens, targets, positions, sources, epoch)` as a named tuple. The
+three matrices have shape `(sequence_len, k)`; positions are zero-based within
+each BOS-prefixed document. Padding has target `-1` and position `0`. A source
+is the document's `DataLoaderState`, or `nothing` for an empty slot.
+
+Each slot continues its document in the next batch. At an epoch boundary,
+active documents finish before the next epoch starts; unused slots are padded.
+Existing `(tokens, targets)` destructuring remains supported. Positions are
+metadata for a future model change; they are not yet passed to RoPE.
+
+Resume with `state=batch_state(previous_batches)`. The snapshot includes
+active token vectors and requires the same files, rank, batch size, sequence
+length, and tokenizer. `loader.state` alone only tracks document reading.
+"""
+function eachbatch(loader::DataLoader, tokenizer, k::Int, sequence_len::Int; state=nothing)
     k > 0 || throw(ArgumentError("batch size must be positive"))
     sequence_len > 0 || throw(ArgumentError("sequence length must be positive"))
+    isempty(loader.files) && throw(ArgumentError("rank has no assigned files"))
 
     bos = bos_token_id(tokenizer)
-    documents = eachdocument(loader, tokenizer)
-    batches = Iterators.partition(documents, k)
+    slots = Union{Nothing,ActiveDocument{typeof(bos)}}[nothing for _ in 1:k]
+    batches = BatchIterator(loader, tokenizer, bos, sequence_len, slots, nothing, nothing, false)
 
-    (model_batch(batch, sequence_len, bos) for batch in batches)
+    if !isnothing(state)
+        (state.files, state.rank, state.world_size, state.sequence_len, length(state.slots)) ==
+            (loader.files, loader.rank, loader.world_size, sequence_len, k) ||
+            throw(ArgumentError("batch snapshot does not match this loader and batch shape"))
+        batches.slots = deepcopy(state.slots)
+        batches.exhausted = state.exhausted
+        loader.state = state.reader
+    end
+
+    batches
+end
+
+"""Copy the next-read cursor and active documents; no live database iterator is saved."""
+batch_state(batches::BatchIterator) = (
+    files=copy(batches.loader.files),
+    rank=batches.loader.rank,
+    world_size=batches.loader.world_size,
+    sequence_len=batches.sequence_len,
+    reader=batches.loader.state,
+    slots=deepcopy(batches.slots),
+    exhausted=batches.exhausted,
+)
+
+function next_active_document!(batches::BatchIterator)
+    loader = batches.loader
+    while !batches.exhausted
+        result = if isnothing(batches.document_rows)
+            batches.document_rows = rows(read_documents(loader))
+            iterate(batches.document_rows)
+        else
+            iterate(batches.document_rows, batches.row_state)
+        end
+
+        if isnothing(result)
+            batches.document_rows = nothing
+            batches.row_state = nothing
+            if loader.state.file == length(loader.files)
+                batches.exhausted = true
+            else
+                next_file!(loader)
+            end
+            continue
+        end
+
+        document, row_state = result
+        (; file, epoch) = loader.state
+        row = Int(document.file_row_number) + 1
+        tokens = tokenize_document(batches.tokenizer, document.text, batches.bos)
+        batches.row_state = row_state
+        loader.state = DataLoaderState(file, row + 1, epoch)
+        length(tokens) > 1 && return ActiveDocument(DataLoaderState(file, row, epoch), tokens, 0)
+    end
+    nothing
+end
+
+function model_batch!(batches::BatchIterator)
+    (; slots, sequence_len, bos) = batches
+    tokens = fill(Int(bos), sequence_len, length(slots))
+    targets = fill(-1, sequence_len, length(slots))
+    positions = zeros(Int, sequence_len, length(slots))
+    sources = [isnothing(doc) ? nothing : doc.source for doc in slots]
+
+    for (column, doc) in enumerate(slots)
+        isnothing(doc) && continue
+        p = doc.position
+        n = min(sequence_len, length(doc.tokens) - 1 - p)
+        @views tokens[1:n, column] .= doc.tokens[p+1:p+n]
+        @views targets[1:n, column] .= doc.tokens[p+2:p+n+1]
+        positions[1:n, column] .= p .+ (0:n-1)
+        doc.position += n
+    end
+
+    (; tokens, targets, positions, sources, epoch=batches.loader.state.epoch)
+end
+
+function Base.iterate(batches::BatchIterator, ::Nothing=nothing)
+    # A resumed cursor may already be at EOF. Try the next epoch as well,
+    # but fail instead of spinning forever when all documents have no targets.
+    for _ in 1:2
+        for column in eachindex(batches.slots)
+            doc = batches.slots[column]
+            if !isnothing(doc) && doc.position == length(doc.tokens) - 1
+                batches.slots[column] = nothing
+            end
+            if isnothing(batches.slots[column])
+                batches.slots[column] = next_active_document!(batches)
+            end
+        end
+        any(!isnothing, batches.slots) && return model_batch!(batches), nothing
+
+        batches.loader.state = DataLoaderState(1, 1, batches.loader.state.epoch + 1)
+        batches.document_rows = nothing
+        batches.row_state = nothing
+        batches.exhausted = false
+    end
+    throw(ArgumentError("assigned files contain no next-token targets"))
 end
 
 Base.IteratorSize(::Type{<:DocumentIterator}) = Base.IsInfinite()
+Base.IteratorSize(::Type{<:BatchIterator}) = Base.IsInfinite()
+Base.IteratorEltype(::Type{<:BatchIterator}) = Base.EltypeUnknown()
 
 function next_file!(loader::DataLoader)
     (; file, epoch) = loader.state
@@ -164,11 +286,9 @@ function next_document(documents::DocumentIterator, document_rows, result)
 
     document, state = result
     (; file, epoch) = documents.loader.state
+    tokens = tokenize_document(documents.tokenizer, document.text, documents.bos)
     documents.loader.state =
         DataLoaderState(file, Int(document.file_row_number) + 2, epoch)
-
-    tokens = documents.tokenizer(document.text)
-    pushfirst!(tokens, documents.bos)
 
     return tokens, (document_rows, state)
 end
