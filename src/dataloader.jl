@@ -28,10 +28,22 @@ end
 
 DataLoaderState() = DataLoaderState(1, 1, 1)
 
+const DEFAULT_MAX_DOCUMENT_TOKENS = 8192
+
+"""
+    DataLoader(files; max_document_tokens=8192, kwargs...)
+    DataLoader(directory, split; max_document_tokens=8192, kwargs...)
+
+Read documents with at most `max_document_tokens` tokens, including BOS.
+The limit must be at least two and is independent of the batch sequence length.
+Documents are fully tokenized before tokens beyond this limit are discarded.
+Use the same limit for the model's document-position RoPE table.
+"""
 mutable struct DataLoader{C}
     files::Vector{String}
     rank::Int
     world_size::Int
+    max_document_tokens::Int
     state::DataLoaderState
     connection::C
 end
@@ -40,18 +52,16 @@ function DataLoader(
     files::AbstractVector{<:AbstractString};
     rank::Int = 0,
     world_size::Int = 1,
+    max_document_tokens::Int = DEFAULT_MAX_DOCUMENT_TOKENS,
     state::DataLoaderState = DataLoaderState(),
     connection = connect(DB, ":memory:"),
 )
     files = sort!(String.(files))
     files = files[rank+1:world_size:end]
-    DataLoader(files, rank, world_size, state, connection)
+    DataLoader(files, rank, world_size, max_document_tokens, state, connection)
 end
 
 function DataLoader(directory::AbstractString, split::Symbol; kwargs...)
-    split in (:train, :test) ||
-        throw(ArgumentError("split must be :train or :test"))
-
     test_shard = "shard_$(lpad(MAX_SHARD, 5, '0')).parquet"
     files = filter(readdir(directory; join=true)) do path
         endswith(path, ".parquet") &&
@@ -84,15 +94,19 @@ function read_documents(loader::DataLoader)
     )
 end
 
-"""Tokenize a batch of documents and prepend BOS to each one."""
-function tokenize_documents(tokenizer, texts)
+"""
+Tokenize documents, prepend BOS, and retain at most `max_document_tokens`
+tokens per document (default 8192, including BOS).
+"""
+function tokenize_documents(tokenizer, texts; max_document_tokens::Int=DEFAULT_MAX_DOCUMENT_TOKENS)
     bos = bos_token_id(tokenizer)
-    map(text -> tokenize_document(tokenizer, text, bos), texts)
+    map(text -> tokenize_document(tokenizer, text, bos, max_document_tokens), texts)
 end
 
-function tokenize_document(tokenizer, text, bos)
+function tokenize_document(tokenizer, text, bos, max_document_tokens)
     tokens = tokenizer(text)
     pushfirst!(tokens, bos)
+    length(tokens) > max_document_tokens && resize!(tokens, max_document_tokens)
     tokens
 end
 
@@ -102,7 +116,7 @@ struct DocumentIterator{L,T,I}
     bos::I
 end
 
-"""Iterate forever over tokenized, BOS-prefixed documents."""
+"""Iterate forever over BOS-prefixed documents capped at `loader.max_document_tokens`."""
 eachdocument(loader::DataLoader, tokenizer) =
     DocumentIterator(loader, tokenizer, bos_token_id(tokenizer))
 
@@ -149,26 +163,22 @@ is the document's `DataLoaderState`, or `nothing` for an empty slot.
 
 Each slot continues its document in the next batch. At an epoch boundary,
 active documents finish before the next epoch starts; unused slots are padded.
+Only the first `loader.max_document_tokens` tokens of each BOS-prefixed document
+are retained, yielding at most `loader.max_document_tokens - 1` targets.
 Existing `(tokens, targets)` destructuring remains supported. Positions are
 metadata for a future model change; they are not yet passed to RoPE.
 
 Resume with `state=batch_state(previous_batches)`. The snapshot includes
 active token vectors and requires the same files, rank, batch size, sequence
-length, and tokenizer. `loader.state` alone only tracks document reading.
+length, document token limit, and tokenizer. `loader.state` alone only tracks
+document reading.
 """
 function eachbatch(loader::DataLoader, tokenizer, k::Int, sequence_len::Int; state=nothing)
-    k > 0 || throw(ArgumentError("batch size must be positive"))
-    sequence_len > 0 || throw(ArgumentError("sequence length must be positive"))
-    isempty(loader.files) && throw(ArgumentError("rank has no assigned files"))
-
     bos = bos_token_id(tokenizer)
     slots = Union{Nothing,ActiveDocument{typeof(bos)}}[nothing for _ in 1:k]
     batches = BatchIterator(loader, tokenizer, bos, sequence_len, slots, nothing, nothing, false)
 
     if !isnothing(state)
-        (state.files, state.rank, state.world_size, state.sequence_len, length(state.slots)) ==
-            (loader.files, loader.rank, loader.world_size, sequence_len, k) ||
-            throw(ArgumentError("batch snapshot does not match this loader and batch shape"))
         batches.slots = deepcopy(state.slots)
         batches.exhausted = state.exhausted
         loader.state = state.reader
@@ -182,6 +192,7 @@ batch_state(batches::BatchIterator) = (
     files=copy(batches.loader.files),
     rank=batches.loader.rank,
     world_size=batches.loader.world_size,
+    max_document_tokens=batches.loader.max_document_tokens,
     sequence_len=batches.sequence_len,
     reader=batches.loader.state,
     slots=deepcopy(batches.slots),
@@ -212,7 +223,7 @@ function next_active_document!(batches::BatchIterator)
         document, row_state = result
         (; file, epoch) = loader.state
         row = Int(document.file_row_number) + 1
-        tokens = tokenize_document(batches.tokenizer, document.text, batches.bos)
+        tokens = tokenize_document(batches.tokenizer, document.text, batches.bos, loader.max_document_tokens)
         batches.row_state = row_state
         loader.state = DataLoaderState(file, row + 1, epoch)
         length(tokens) > 1 && return ActiveDocument(DataLoaderState(file, row, epoch), tokens, 0)
@@ -241,9 +252,7 @@ function model_batch!(batches::BatchIterator)
 end
 
 function Base.iterate(batches::BatchIterator, ::Nothing=nothing)
-    # A resumed cursor may already be at EOF. Try the next epoch as well,
-    # but fail instead of spinning forever when all documents have no targets.
-    for _ in 1:2
+    while true
         for column in eachindex(batches.slots)
             doc = batches.slots[column]
             if !isnothing(doc) && doc.position == length(doc.tokens) - 1
@@ -260,7 +269,6 @@ function Base.iterate(batches::BatchIterator, ::Nothing=nothing)
         batches.row_state = nothing
         batches.exhausted = false
     end
-    throw(ArgumentError("assigned files contain no next-token targets"))
 end
 
 Base.IteratorSize(::Type{<:DocumentIterator}) = Base.IsInfinite()
@@ -286,7 +294,7 @@ function next_document(documents::DocumentIterator, document_rows, result)
 
     document, state = result
     (; file, epoch) = documents.loader.state
-    tokens = tokenize_document(documents.tokenizer, document.text, documents.bos)
+    tokens = tokenize_document(documents.tokenizer, document.text, documents.bos, documents.loader.max_document_tokens)
     documents.loader.state =
         DataLoaderState(file, Int(document.file_row_number) + 2, epoch)
 
