@@ -32,6 +32,7 @@ struct MooncakeGradientState{M,C}
 end
 
 function gradient_state(
+    ::Type{Mooncake.DefaultCtx},
     params::Params{T,P},
     config::GPTConfig,
     layout,
@@ -363,9 +364,9 @@ function Mooncake.rrule!!(
     V::CoDual{<:CuArray{T,4},<:CuArray{T,4}},
     window::CoDual{<:Tuple{Int,Int},NoFData},
 ) where {T<:AbstractFloat}
-    pQ, dQ = arrayify(Q)
-    pK, dK = arrayify(K)
-    pV, dV = arrayify(V)
+    pQ, dQ = primal(Q), tangent(Q)
+    pK, dK = primal(K), tangent(K)
+    pV, dV = primal(V), tangent(V)
     pwindow = primal(window)
 
     saved = attention_state(primal(f),pQ,pK,pV,pwindow)
