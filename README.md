@@ -9,6 +9,7 @@ The main dependencies are:
   * [Enzyme](https://github.com/EnzymeAD) for auto-differentiation. Enzyme (like tapanade) is a compiler-level autodiff engine, which supports custom rules (e.g. Flash Attention reverse) as well as other languages like Rust.
   * [Mooncake](https://github.com/chalk-lab/Mooncake.jl) as an alternative autodiff backend because my 5-year old Dell laptop I'm prototyping this on uses an ancient `GTX
 1050` that supports CUDA 11.1. Enzyme fails compilation. This requires quite a lot of additional backwards rules (which I've had Codex write). 
+  * [Reactant.jl] provides MLIR / XLA compilation, which is broadly similar to `torch.compile`. It provides a ~25% speed boost to plain Julia w/ Enzume. It remains about 5% slower than PyTorch. 
   * [DuckDB](https://duckdb.org/) for handling Parquet files. 
   * [CUDA.jl](https://cuda.juliagpu.org/stable/) for running on GPUs.
 
@@ -21,7 +22,7 @@ Using Julia allows some of the benefits of Python (strong REPL, interactive expe
 ## Notes:
 
   * Julia is columnar orientated, so the batch shape is different. We use `D x T x B` i.e. each token is a column, and then we group by batches. PyTorch tends to us `B x T x D` instead.
-  * We add `parameters.jl` to keep track of parameters, which is something PyTorch handles in `nanochat`. We create a flat parameter vector and map the model into it; this allows us to accumulate gradients in a second flat parameter vector. 
+  * We add `parameters.jl` to keep track of parameters, which is something PyTorch handles in `nanochat`. We create a flat parameter vector and map the model into it (Θ); this allows us to accumulate gradients in a second flat parameter vector (δ). 
 
 ## Example
 
@@ -40,94 +41,47 @@ train!(tokenizer, 2^11,  "data/")
 # [ Info: this is a test
 ```
 
-### Model Loss
-
-On CPU, the loss and reverse pass can be written out directly. Enzyme sees the
-flat parameter vector `Θ` as active and accumulates its gradient into `δ`; it
-does not need a second model.
+### Model
 
 ```julia
-using FemtoChat
-using Enzyme
-using Random
+import FemtoChat
+using FemtoChat: GPTConfig, parameter_layout, Params, initialize!, 🤖
+using Reactant, Enzyme, CUDA, Random
+using Enzyme: ReverseWithPrimal, Const, Active, Duplicated
+using Reactant: @compile, to_rarray, ConcreteRArray, ReactantRNG
 
-config = GPTConfig(
-    sequence_len = 4,
-    vocab_size = 8,
-    n_layer = 1,
-    n_head = 4,
-    n_kv_head = 2,
-    n_embed = 24,
-    window_pattern = "L",
-)
+Reactant.set_default_backend("gpu")
 
-layout = parameter_layout(config)
-params = Params(Vector{Float32}(undef, layout.nparams))
-ℛ = MersenneTwister(42)
-initialize!(params, layout, ℛ)
+let
+    rng = Random.seed!(ReactantRNG(), 123)
+    config = GPTConfig(sequence_len=4, vocab_size=16, n_layer=2, n_head=2, n_kv_head=1, n_embed=32, window_pattern="L")
+    layout = parameter_layout(config)
+    # Create parameter and gradient vector on GPU device
+    params = Params(ConcreteRArray{Float32}(undef, layout.nparams))
+    initialize!(params, layout, rng)
+    model = 🤖(params, config, layout)
+    tokens, targets = to_rarray.((Int32[1:4 2:5], Int32[2:5 3:6]))
+    Nₜ = count(!=(-1), targets)
 
-(; Θ, δ) = params
+    # Register Julia attention (~flash attention) with Reactant
+    extension = Base.get_extension(FemtoChat, :FemtoChatReactantExt)
+    extension.prepare_attention(config, tokens)
 
-tokens = Int[1:4 2:5]
-targets = Int[2:5 3:6]
+    ℒ = (tokens, targets) -> model(tokens, targets; reduction=:sum)
+    ∇ℒ! = @compile sync=true ((tokens, targets) -> Enzyme.autodiff(
+        ReverseWithPrimal, Duplicated(ℒ, params), Active, Const(tokens), Const(targets),
+    ))(tokens, targets)
 
-# Make the parameter dependence explicit to Enzyme.
-ℒ(Θ, config, layout, tokens, targets) =
-    🤖(Θ, config, layout)(tokens, targets)
+    η = .01f0
+    (; Θ, δ) = params
+    for step in 1:10
+        fill!(δ, 0f0) # Zero out gradients
+        _, ℒₛ = ∇ℒ!(tokens, targets)
+        δ ./= Nₜ # Divide gradient by tokens to get average
+        Θ .-= η .* δ # Step in gradient direction
 
-fill!(δ, 0f0)
-Enzyme.API.strictAliasing!(false)
-Enzyme.API.looseTypeAnalysis!(true)
-mode = Enzyme.set_runtime_activity(Enzyme.ReverseWithPrimal)
-
-_, ℒ₀ = Enzyme.autodiff(
-    mode,
-    ℒ,
-    Enzyme.Active,
-    Enzyme.Duplicated(params),
-    Enzyme.Const(config),
-    Enzyme.Const(layout),
-    Enzyme.Const(tokens),
-    Enzyme.Const(targets),
-)
-
-Θ .-= 0.01f0 .* δ
-ℒ₁ = 🤖(params, config, layout)(tokens, targets)
-
-@info (; ℒ₀, ℒ₁)
-@assert ℒ₀ > ℒ₁
-```
-
-### Dataset Loading
-
-```julia
-using FemtoChat
-using Enzyme
-using Random
-using Iterators: take
-
-directory = joinpath("data", "climbmix-400b-shuffle")
-tokenizer = BPETokenizer()
-train!(tokenizer, 2^9, joinpath(directory, "shard_00000.parquet"),)
-
-config = GPTConfig(sequence_len = 512, vocab_size = length(tokenizer.vocab), n_layer = 4,n_head = 2,n_kv_head = 2,n_embed = 256,window_pattern = "SSSL",)
-
-layout = parameter_layout(config)
-params = Params(Vector{Float32}(undef, layout.nparams))
-ℛ = MersenneTwister(42)
-initialize!(params, layout, ℛ)
-
-(; Θ, δ) = params
-
-loader = DataLoader(directory, :train)
-batches = eachbatch(loader, tokenizer, 1, config.sequence_len,)
-
-η = 0.01f0
-for (kₛ, (x̄, ȳ)) in enumerate(take(batches, 10))
-    ℒₛ = loss_and_gradient!(params, config, layout, x̄, ȳ)
-
-    Θ .-= η .* δ # Update model parameters with small step in gradient direction
-
-    @info (; kₛ, ℒₛ)
+        @info (; step, ℒₛ=ℒₛ / Nₜ)
+    end
 end
 ```
+
