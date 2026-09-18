@@ -5,13 +5,6 @@ using LinearAlgebra: mul!
 export attention, softmax!
 
 # Reverse kernels; CUDA specializes these without changing the forward model.
-function norm_gradient!(δ, dy, x, r)
-    D = size(x,1)
-    dot = sum(dy .* x; dims=1)
-    @. δ += r * dy - x * r^3 * dot / D
-    nothing
-end
-
 function embedding_gradient!(δ, dy, tokens)
     D = size(δ,1)
     @inbounds for token in eachindex(tokens), d in 1:D
