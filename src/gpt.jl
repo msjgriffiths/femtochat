@@ -13,12 +13,10 @@ softcap(x, c=15f0) = @. c * tanh(x / c)
 relu²(x) = max.(x, zero(eltype(x))) .^ 2
 const Σ = sum
 
-function norm_state(x, ϵ)
+function norm(x, ϵ=eps(Float32))
     D = size(x, 1) # Since we're column orientated, first dimension is token embedding size
-    r = inv.(sqrt.(Σ(abs2, x; dims=1) ./ D .+ ϵ))
-    x .* r, r
+    x ./ sqrt.(Σ(abs2, x; dims=1) ./ D .+ ϵ)
 end
-norm(x, ϵ=eps(Float32)) = first(norm_state(x,ϵ))
  ∥(x) = norm(x)
 
 function (ℓ::Linear)(x::AbstractArray)
