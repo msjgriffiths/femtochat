@@ -53,12 +53,12 @@ using Reactant: @compile, to_rarray, ConcreteRArray, ReactantRNG
 Reactant.set_default_backend("gpu")
 
 let
-    rng = Random.seed!(ReactantRNG(), 123)
+    𝓡 = Random.seed!(ReactantRNG(), 123)
     config = GPTConfig(sequence_len=4, vocab_size=16, n_layer=2, n_head=2, n_kv_head=1, n_embed=32, window_pattern="L")
     layout = parameter_layout(config)
     # Create parameter and gradient vector on GPU
     params = Params(ConcreteRArray{Float32}(undef, layout.nparams))
-    initialize!(params, layout, rng)
+    initialize!(params, layout, 𝓡)
     model = 🤖(params, config, layout)
     tokens, targets = to_rarray.((Int32[1:4 2:5], Int32[2:5 3:6]))
     Nₜ = count(!=(-1), targets)
