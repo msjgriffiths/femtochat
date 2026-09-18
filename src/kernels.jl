@@ -16,8 +16,8 @@ end
 function cross_entropy_gradient!(δ, logits, targets, dy, ignore_index, reduction)
     V,T,B = size(logits)
     valid = targets .!= ignore_index
-    scale = reduction == :mean ? dy ./ sum(valid; dims=(1,2)) : dy
-    scale = reshape(scale,1,size(scale)...)
+    scale = reduction == :none ? reshape(dy,1,T,B) :
+        reduction == :mean ? dy / sum(valid) : dy
     target, valid = reshape(targets,1,T,B), reshape(valid,1,T,B)
     vocabulary = reshape(1:V,V,1,1)
     maximum_logit = maximum(logits; dims=1)

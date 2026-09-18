@@ -26,7 +26,7 @@ function loss_and_gradient! end
 function gradient_state end
 
 ℒ(Θ, config, layout, tokens, targets) =
-    sum(🤖(Θ, config, layout)(tokens, targets))
+    🤖(Θ, config, layout)(tokens, targets)
 
 export Params,
        AdamW,
