@@ -75,14 +75,14 @@ Configuration parameters for GPT model. These are used to determine how
 end
 
 struct Linear{
-    T<:ParamFloat,
+    T<:Number,
     A<:AbstractMatrix{T},
 }
     𝕎::A
 end
 
 struct Embedding{
-    T<:ParamFloat,
+    T<:Number,
     A<:AbstractMatrix{T},
 }
     𝔼::A
@@ -110,13 +110,17 @@ end
 Attention block
 Attention is 👀 since it looks at everything, and 🧠 is a callback to old Perceptron days.
 """
-struct Block 
-    👀::CausalSelfAttention
-    🧠::MLP
-    🍰::Union{Nothing,Embedding}
-    λᵦ::AbstractVector{<:ParamFloat}
-    λx₀::AbstractVector{<:ParamFloat}
+struct Block{L<:Linear,E<:Embedding,V<:AbstractVector}
+    👀::CausalSelfAttention{L}
+    🧠::MLP{L}
+    🍰::Union{Nothing,E}
+    λᵦ::V
+    λx₀::V
 end
+
+Block(👀::CausalSelfAttention{L}, 🧠::MLP{L}, ::Nothing, λᵦ::V, λx₀::V) where {
+    T<:Number,A<:AbstractMatrix{T},L<:Linear{T,A},V<:AbstractVector} =
+        Block{L,Embedding{T,A},V}(👀,🧠,nothing,λᵦ,λx₀)
 
 struct Transformer{
     E<:Embedding,
@@ -131,9 +135,9 @@ struct 🤖{
     L<:Linear,
     W<:AbstractVector{Tuple{Int,Int}},
     S<:Linear,
-    SL<:AbstractVector{<:ParamFloat},
-    BL<:AbstractVector{<:ParamFloat},
-    R<:Tuple{AbstractMatrix{<:AbstractFloat}, AbstractMatrix{<:AbstractFloat}},
+    SL<:AbstractVector{<:Number},
+    BL<:AbstractVector{<:Number},
+    R<:Tuple{AbstractMatrix{<:Number}, AbstractMatrix{<:Number}},
 }
     config::GPTConfig
 
@@ -423,15 +427,17 @@ Construct a GPT model whose trainable tensors are zero-copy views into
 function 🤖(
     params::Params,
     config::GPTConfig,
-    layout,
+    layout;
+    kwargs...,
 )
-    🤖(params.Θ, config, layout)
+    🤖(params.Θ, config, layout; kwargs...)
 end
 
 function 🤖(
-    Θ::AbstractVector{<:ParamFloat},
+    Θ::AbstractVector{<:Number},
     config::GPTConfig,
-    layout,
+    layout;
+    rope_sin_cos=rotary_embeddings(typeof(Θ),10config.sequence_len,config.n_embed ÷ config.n_head),
 )
     length(Θ) == layout.nparams ||
         throw(DimensionMismatch(
@@ -463,12 +469,6 @@ function 🤖(
     λᵧ = paramview(
         Θ,
         layout.λᵧ,
-    )
-
-    rope_sin_cos = rotary_embeddings(
-        typeof(Θ),
-        10 * config.sequence_len,
-        config.n_embed ÷ config.n_head,
     )
 
     🤖(

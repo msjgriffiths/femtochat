@@ -9,13 +9,13 @@ export AdamW, Muon, MuonAdamW, polar_express
 # CuArray avoids synchronizing a scalar through the CPU inside an optimizer step.
 frobenius(X) = sqrt.(sum(abs2, X; dims=(1, 2)))
 
-mutable struct AdamW{F<:AbstractFloat,V<:AbstractVector}
+mutable struct AdamW{F<:AbstractFloat,V<:AbstractVector,I}
     α::F
     β₁::F
     β₂::F
     𝓂ₜ::V
     𝓋ₜ::V
-    t::Int
+    t::I
     ϵ::F
     λ::F
 end
@@ -105,30 +105,49 @@ def PolarExpress(G:torch.Tensor,steps:int)->torch.Tensor:
     ifG.size(-2)>G.size(-1):X=X.mT
     return X
 """
-function polar_express(G::AbstractMatrix; steps::Int=5)
-    @assert 1 ≤ steps ≤ length(ρₜ)
-
-    transposed = size(G, 1) > size(G, 2)
-    scale = 1.01f0 .* frobenius(G) .+ 1f-6
-    X = transposed ? G' ./ scale : G ./ scale
-
-    A = similar(X, size(X, 1), size(X, 1))
-    B, Y = similar(A), similar(X)
-
-    for t in 1:steps
-        a, b, c = ρₜ[t]
-
-        mul!(A, X, X')       # A = XX'
-        mul!(B, A, A)        # B = A²
-        @. B = b * A + c * B
-        mul!(Y, B, X)
-        @. X = a * X + Y
-    end
-
-    return transposed ? X' : X
+function polar_workspace(G, F=eltype(G))
+    m, n, k = size(G,1), size(G,2), size(G,3)
+    X = similar(G, F, min(m,n), max(m,n), k)
+    A = similar(X, min(m,n), min(m,n), k)
+    (; X, A, B=similar(A), Y=similar(X), scale=similar(G, Float32, 1,1,k))
 end
 
-mutable struct Muon{F<:AbstractFloat,M<:AbstractMatrix}
+# CPU loops over matrices; CUDA dispatch uses one strided-batched GEMM.
+function batched_mul!(C, A, B, transpose_A=false, transpose_B=false)
+    for k in axes(C,3)
+        @views mul!(C[:,:,k], transpose_A ? A[:,:,k]' : A[:,:,k],
+                              transpose_B ? B[:,:,k]' : B[:,:,k])
+    end
+    C
+end
+
+function polar_express!(G, work, steps)
+    (; X, A, B, Y, scale) = work
+    transposed = size(G,1) > size(G,2)
+    sum!(abs2, scale, G)
+    @. scale = 1.01f0 * sqrt(scale) + 1f-6
+    input = transposed ? PermutedDimsArray(G, (2,1,3)) : G
+    @. X = input / scale
+    for t in 1:steps
+        a, b, c = ρₜ[t]
+        batched_mul!(A, X, X, false, true)
+        batched_mul!(B, A, A)
+        @. B = b * A + c * B
+        batched_mul!(Y, B, X)
+        @. X = a * X + Y
+    end
+    output = transposed ? PermutedDimsArray(X, (2,1,3)) : X
+    G .= output
+    G
+end
+
+function polar_express(G::AbstractMatrix; steps::Int=5)
+    X = reshape(copy(G), size(G)..., 1)
+    polar_express!(X, polar_workspace(X), steps)
+    reshape(X, size(G))
+end
+
+mutable struct Muon{F<:AbstractFloat,M<:AbstractArray,W}
     α::F
     μ::F
     β₂::F
@@ -136,59 +155,68 @@ mutable struct Muon{F<:AbstractFloat,M<:AbstractMatrix}
     steps::Int
     𝓂ₜ::M
     𝓋ₜ::M
+    work::W
 end
 
 function Muon(
-    θ::AbstractMatrix;
+    θ::AbstractArray;
     α=0.02f0,
     μ=0.95f0,
     β₂=0.9f0,
     λ=0.01f0,
     steps=5,
+    compute_type=Float32,
 )
-    m, n = size(θ)
+    m, n, k = size(θ,1), size(θ,2), size(θ,3)
 
-    𝓂ₜ = similar(θ)
-    𝓋ₜ = similar(θ, m ≥ n ? (m, 1) : (1, n))
+    𝓂ₜ = similar(θ, Float32, m,n,k)
+    𝓋ₜ = similar(θ, Float32, m ≥ n ? (m,1,k) : (1,n,k))
     fill!(𝓂ₜ, 0f0)
     fill!(𝓋ₜ, 0f0)
 
-    return Muon(α, μ, β₂, λ, steps, 𝓂ₜ, 𝓋ₜ)
+    X = similar(𝓂ₜ)
+    work = (; X, polar=polar_workspace(X, compute_type),
+        row=similar(X,m,1,k), old=similar(X,1,1,k), new=similar(X,1,1,k),
+        v_mean=similar(𝓋ₜ), step_size=similar(𝓋ₜ), scaled=similar(𝓋ₜ))
+    return Muon(α, μ, β₂, λ, steps, 𝓂ₜ, 𝓋ₜ, work)
 end
 
 function (ω::Muon)(θ, gₜ)
-    (; α, μ, β₂, λ, steps, 𝓂ₜ, 𝓋ₜ) = ω
-    m, n = size(θ)
+    (; α, μ, β₂, λ, steps, 𝓂ₜ, 𝓋ₜ, work) = ω
+    (; X, row, old, new, v_mean, step_size, scaled) = work
+    m, n = size(θ,1), size(θ,2)
+    θ = reshape(θ, size(𝓂ₜ))
+    gₜ = reshape(gₜ, size(𝓂ₜ))
 
     # Nesterov momentum
     @. 𝓂ₜ = μ * 𝓂ₜ + (1f0 - μ) * gₜ
-    X = @. (1f0 - μ) * gₜ + μ * 𝓂ₜ
+    @. X = (1f0 - μ) * gₜ + μ * 𝓂ₜ
 
     # MuonEq row equilibration
-    target = frobenius(X) ./ √Float32(m)
-    row_norm = sqrt.(sum(abs2, X; dims=2))
-    @. X *= target / max(row_norm, 1f-6)
+    sum!(abs2, old, X)
+    sum!(abs2, row, X)
+    @. X *= sqrt(old / m) / max(sqrt(row), 1f-6)
 
     # Polar Express
-    X = polar_express(X; steps)
+    polar_express!(X, work.polar, steps)
 
     # Muon+ renormalization
-    X .*= √Float32(min(m, n)) ./ max.(frobenius(X), 1f-6)
+    sum!(abs2, old, X)
+    @. X *= sqrt(Float32(min(m,n))) / max(sqrt(old), 1f-6)
 
     # NorMuon variance reduction
     dimension = m ≥ n ? 2 : 1
     dimension_size = size(X, dimension)
-    v_mean = sum(abs2, X; dims=dimension) ./ dimension_size
+    sum!(abs2, v_mean, X)
+    v_mean ./= dimension_size
 
     @. 𝓋ₜ = β₂ * 𝓋ₜ + (1f0 - β₂) * v_mean
-    step_size = @. inv(√max(𝓋ₜ, 1f-10))
+    @. step_size = inv(√max(𝓋ₜ, 1f-10))
 
-    old_norm = frobenius(X)
-    new_norm = sqrt.(sum(
-        dimension_size .* v_mean .* step_size.^2;
-        dims=(1, 2),
-    ))
-    @. X *= step_size * old_norm / max(new_norm, 1f-10)
+    sum!(abs2, old, X)
+    @. scaled = dimension_size * v_mean * step_size^2
+    sum!(new, scaled)
+    @. X *= step_size * sqrt(old) / max(sqrt(new), 1f-10)
 
     # Shape-adjusted learning rate and cautious decay
     η = α * √max(1f0, Float32(m) / Float32(n))
@@ -203,6 +231,46 @@ struct ParameterUpdate{O,P,G}
     δ::G
 end
 
+# Parameter storage stays flat; only the optimizer's working matrices are stacked.
+struct MuonGroup{U,P,I}
+    update::U
+    params::P
+    offsets::I
+end
+
+function gather!(stack, vector, offsets)
+    width = size(stack,1) * size(stack,2)
+    for k in eachindex(offsets), i in 1:width
+        @inbounds stack[i + (k-1)*width] = vector[offsets[k] + i]
+    end
+    stack
+end
+
+function scatter!(vector, stack, offsets)
+    width = size(stack,1) * size(stack,2)
+    for k in eachindex(offsets), i in 1:width
+        @inbounds vector[offsets[k] + i] = stack[i + (k-1)*width]
+    end
+    vector
+end
+
+function (group::MuonGroup)()
+    (; update, params, offsets) = group
+    gather!(update.θ, params.Θ, offsets)
+    gather!(update.δ, params.δ, offsets)
+    update()
+    scatter!(params.Θ, update.θ, offsets)
+    nothing
+end
+
+function muon_group(params, specs; kwargs...)
+    shape = (first(specs).shape..., length(specs))
+    θ, δ = similar(params.Θ, shape), similar(params.δ, shape)
+    offsets = similar(params.δ, Int, length(specs))
+    copyto!(offsets, [first(spec.range)-1 for spec in specs])
+    MuonGroup(ParameterUpdate(Muon(δ; kwargs...), θ, δ), params, offsets)
+end
+
 (update::ParameterUpdate)() = update.ω(update.θ, update.δ)
 
 function adamw_update(params::Params, spec; kwargs...)
@@ -211,21 +279,16 @@ function adamw_update(params::Params, spec; kwargs...)
     ParameterUpdate(AdamW(θ; kwargs...), θ, δ)
 end
 
-function muon_update(params::Params, spec::ParamSpec{2}; kwargs...)
-    θ = paramview(params.Θ, spec)
-    δ = paramview(params.δ, spec)
-    ParameterUpdate(Muon(δ; kwargs...), θ, δ)
-end
-
 struct MuonAdamW{A,M}
     adamw::A
     muon::M
 end
 
 """
-Build nanochat's optimizer groups as zero-copy views into `params`.
+Build nanochat's optimizer groups over the flat parameter storage.
 
-Transformer-block matrices use Muon. Embeddings, the language-model head,
+Transformer-block matrices use Muon, batched by shape with reusable workspaces.
+AdamW uses zero-copy views. Embeddings, the language-model head,
 residual scalars, and smear parameters use their corresponding AdamW settings.
 """
 function MuonAdamW(
@@ -237,6 +300,7 @@ function MuonAdamW(
     weight_decay=0f0,
     scalar_lr=0.5f0,
     smear_lr=0.2f0,
+    compute_type=Float32,
 )
     D = layout.transformer.embedding.shape[1]
     scale = √(768f0 / D)
@@ -314,17 +378,19 @@ function MuonAdamW(
         isnothing(👀.𝕧𝕖) || push!(muon_specs, 👀.𝕧𝕖)
     end
 
+    shapes = unique(spec.shape for spec in muon_specs)
     muon = [
-        muon_update(
+        muon_group(
             params,
-            spec;
+            filter(spec -> spec.shape == shape, muon_specs);
             α=Float32(matrix_lr),
             μ=0.95f0,
             β₂=0.9f0,
             λ=Float32(weight_decay),
             steps=5,
+            compute_type,
         )
-        for spec in muon_specs
+        for shape in shapes
     ]
 
     return MuonAdamW(adamw, muon)

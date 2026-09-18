@@ -7,14 +7,18 @@ using ..Kernels
 function sigmoid(x)
     @. 1 / (1 + exp(-x))
 end
-σ = sigmoid
+const σ = sigmoid
 
-Σ = sum
+softcap(x, c=15f0) = @. c * tanh(x / c)
+relu²(x) = max.(x, zero(eltype(x))) .^ 2
+const Σ = sum
 
-function norm(x, ϵ=eps(Float32))
+function norm_state(x, ϵ)
     D = size(x, 1) # Since we're column orientated, first dimension is token embedding size
-    x ./ sqrt.(Σ(abs2, x; dims=1) ./ D .+ ϵ )
+    r = inv.(sqrt.(Σ(abs2, x; dims=1) ./ D .+ ϵ))
+    x .* r, r
 end
+norm(x, ϵ=eps(Float32)) = first(norm_state(x,ϵ))
  ∥(x) = norm(x)
 
 function (ℓ::Linear)(x::AbstractArray)
@@ -26,14 +30,8 @@ function (ℓ::Linear)(x::AbstractArray)
     reshape(Y, size(ℓ.𝕎, 1), Base.tail(size(x))...)
 end
 
-(𝔼::Embedding)(token_ids::AbstractVector{<:Integer}) = 𝔼.𝔼[:, token_ids]
-
-function (𝔼::Embedding)(tokens::AbstractMatrix{<:Integer})
-    D = size(𝔼.𝔼, 1)
-    T, B = size(tokens)
-
-    reshape(𝔼.𝔼[:, vec(tokens)], D, T, B)
-end
+# Matrix indices preserve their token × batch shape after the embedding axis.
+(𝔼::Embedding)(tokens::Union{AbstractVector,AbstractMatrix}) = 𝔼.𝔼[:, tokens]
 
 leading_channels(x, n) = x[1:n, :, :]
 smear_input(x) = x[1:24, 2:end, :]
@@ -46,7 +44,7 @@ end
 
 function (m::MLP)(x::AbstractArray)
     x = m.𝔽(x)
-    x = max.(x, zero(eltype(x))) .^ 2
+    x = relu²(x)
     m.ℙ(x)
 end
 
@@ -90,7 +88,7 @@ function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Unio
     if !isnothing(𝕧𝕖)
         VE = reshape(ve, head_dim, n_kv_head, T, B) # Match shape of V above 
         gate = 3sigmoid(𝕧𝕖(leading_channels(x, 12))) # Range (0, 3)
-        V .+= reshape(gate, 1, n_kv_head, T, B) .* VE # Residual connection
+        V = V .+ reshape(gate, 1, n_kv_head, T, B) .* VE
     end
 
     # Rotary Embedding (RoPE) from https://arxiv.org/abs/2104.09864
@@ -126,7 +124,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
     backout_layer = n_layer ÷ 2 + 1
     for (i, block) in enumerate(ω.transformer.blocks)
         (; 🍰, λᵦ, λx₀) = block
-        x = @. λᵦ * x + λx₀ * x₀ # X is linear interpolation between the original x and the current x
+        x = @. λᵦ * x + λx₀ * x₀
         # Get value embedding matrix from this block given tokens
         # We pull out embedding matrix here because we have tokens here, instead of 
         # passing token indexes down. 
@@ -144,10 +142,9 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
 
     x = norm(x)
 
-    softcap = 15f0
-    logits = leading_channels(ω.lm_head(x), vocab_size)
-    @. logits = softcap * tanh(logits / softcap)
-    logits
+    logits = ω.lm_head(x)
+    vocab_size == size(logits,1) || (logits = leading_channels(logits,vocab_size))
+    softcap(logits)
 end
 
 cross_entropy(logits::AbstractArray, targets; ignore_index=-1, reduction=:mean) =
@@ -162,7 +159,7 @@ function cross_entropy(logits::AbstractArray, targets, ignore_index, reduction)
 
     maximum_logit = maximum(logits; dims=1)
     normalizer = sum(exp.(logits .- maximum_logit); dims=1)
-    target_logit = reshape(reshape(logits, :)[vec(index)], T, B)
+    target_logit = logits[index]
     losses = reshape(maximum_logit .+ log.(normalizer), T, B) .- target_logit
 
     if reduction == :mean
@@ -175,7 +172,7 @@ function cross_entropy(logits::AbstractArray, targets, ignore_index, reduction)
     end
 end
 
-function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray{<:Integer})
+function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray)
     logits = ω(tokens)
     cross_entropy(logits, targets)
 end

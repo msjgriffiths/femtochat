@@ -4,6 +4,36 @@ using LinearAlgebra: mul!
 
 export attention, softmax!
 
+# Reverse kernels; CUDA specializes these without changing the forward model.
+function norm_gradient!(δ, dy, x, r)
+    D = size(x,1)
+    dot = sum(dy .* x; dims=1)
+    @. δ += r * dy - x * r^3 * dot / D
+    nothing
+end
+
+function embedding_gradient!(δ, dy, tokens)
+    D = size(δ,1)
+    @inbounds for token in eachindex(tokens), d in 1:D
+        δ[d,tokens[token]] += dy[d + (token-1)*D]
+    end
+    nothing
+end
+
+function cross_entropy_gradient!(δ, logits, targets, dy, ignore_index, reduction)
+    V,T,B = size(logits)
+    valid = targets .!= ignore_index
+    scale = reduction == :mean ? dy ./ sum(valid; dims=(1,2)) : dy
+    scale = reshape(scale,1,size(scale)...)
+    target, valid = reshape(targets,1,T,B), reshape(valid,1,T,B)
+    vocabulary = reshape(1:V,V,1,1)
+    maximum_logit = maximum(logits; dims=1)
+    normalizer = sum(exp.(logits .- maximum_logit); dims=1)
+    @. δ += ifelse(valid,scale *
+        (exp(logits - maximum_logit) / normalizer - (vocabulary == target)),0)
+    nothing
+end
+
 function attention_mask!(mask, keys, queries, window)
     left, right = window
     key = reshape(keys, :, 1)
