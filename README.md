@@ -68,6 +68,7 @@ let
     extension.prepare_attention(config, tokens)
 
     ℒ = (tokens, targets) -> model(tokens, targets; reduction=:sum)
+    # Compile the forward and backward pass of the model w/ XLA + MLIR
     ∇ℒ! = @compile sync=true ((tokens, targets) -> Enzyme.autodiff(ReverseWithPrimal, Duplicated(ℒ, params), Active, Const(tokens), (targets),))(tokens, targets)
 
     η = .01f0
