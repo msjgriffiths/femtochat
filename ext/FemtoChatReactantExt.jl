@@ -3,11 +3,36 @@ module FemtoChatReactantExt
 using FemtoChat, Reactant, CUDA
 import Enzyme
 using Enzyme: ReverseWithPrimal, Const
-using FemtoChat.Parameters: rotary_embeddings, window_sizes
-import FemtoChat: gradient_state, loss_and_gradient!, ℒ
+using FemtoChat.Parameters: window_sizes
+import FemtoChat.Parameters: rotary_embeddings
+import FemtoChat: initialize!, gradient_state, loss_and_gradient!, ℒ
 import FemtoChat.Kernels: attention
 
 include("reactant/cuda_call.jl")
+
+# Reactant 0.2.285 collapses a one-element parameter view to a scalar index.
+# Preserve its range when writing traced data back into the flat vector.
+function Reactant.TracedUtils.set_mlir_data!(
+    x::SubArray{Reactant.TracedRNumber{T},1,<:Reactant.TracedRArray,
+                Tuple{UnitRange{Int}},true}, data,
+) where T
+    parent(x)[only(parentindices(x))] = Reactant.TracedRArray{T}(data)
+    x
+end
+
+# Generate weights on the device; only the layer specifications are static.
+function initialize!(params::Params{Float32,<:Reactant.ConcreteRArray}, layout,
+                     ℛ=Reactant.ReactantRNG())
+    layout = (;layout...,transformer=(;layout.transformer...,blocks=Tuple(layout.transformer.blocks)))
+    Reactant.@jit initialize!(params.Θ,layout,ℛ)
+    nothing
+end
+
+# Trace range construction too, so RoPE is generated on the selected device.
+function rotary_embeddings(::Type{<:Reactant.ConcreteRArray{T}}, seq_len::Int,
+                           head_dim::Int, base::AbstractFloat=100_000f0) where T
+    Reactant.@jit rotary_embeddings(Reactant.TracedRArray{T,1},seq_len,head_dim,base)
+end
 
 struct Forward{A,Window} end
 struct Backward{A,Window} end
@@ -69,7 +94,7 @@ function attention(Q::Reactant.AnyTracedRArray{F,4}, K::Reactant.AnyTracedRArray
 end
 
 ℒ(Θ,config,layout,rope,tokens,targets) =
-    sum(🤖(Θ,config,layout;rope_sin_cos=rope)(tokens,targets))
+    🤖(Θ,config,layout;rope_sin_cos=rope)(tokens,targets)
 
 function gradient!(Θ,δ,config,layout,rope,tokens,targets)
     result = Enzyme.gradient(ReverseWithPrimal,ℒ,Θ,Const(config),Const(layout),

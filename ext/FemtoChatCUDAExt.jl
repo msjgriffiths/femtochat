@@ -1,6 +1,109 @@
 module FemtoChatCUDAExt
 
+import FemtoChat.Optimizer: batched_mul!, gather!, scatter!
+import FemtoChat.Kernels: embedding_gradient!, cross_entropy_gradient!
+import FemtoChat.GPT: cross_entropy
+
 using CUDA
+
+@inline function reduce_block(op, value, neutral)
+    lane, warp = (threadIdx().x-1) % 32, (threadIdx().x-1) ÷ 32
+    partial = CuStaticSharedArray(Float32,32)
+    value = reduce_lanes(op,value,Val(32))
+    lane == 0 && (@inbounds partial[warp+1] = value)
+    sync_threads()
+    value = lane < blockDim().x÷32 ? (@inbounds partial[lane+1]) : neutral
+    value = reduce_lanes(op,value,Val(32))
+    sync_threads()
+    value
+end
+
+# A block owns one token's vocabulary column. No vocabulary-sized probabilities.
+function cross_entropy_kernel!(losses, δ, logits, targets, scale, ignore, ::Val{Reverse}) where Reverse
+    token, V = blockIdx().x, size(logits,1)
+    offset = (token-1)*V
+    maximum_logit = -Inf32
+    @inbounds for v in threadIdx().x:blockDim().x:V
+        maximum_logit = max(maximum_logit,logits[offset+v])
+    end
+    maximum_logit = reduce_block(max,maximum_logit,-Inf32)
+    normalizer = 0f0
+    @inbounds for v in threadIdx().x:blockDim().x:V
+        normalizer += exp(logits[offset+v] - maximum_logit)
+    end
+    normalizer = reduce_block(+,normalizer,0f0)
+    @inbounds target = targets[token]
+    if Reverse
+        @inbounds weight = scale[length(scale) == 1 ? 1 : token]
+        @inbounds for v in threadIdx().x:blockDim().x:V
+            δ[offset+v] += target == ignore ? 0f0 : weight *
+                (exp(logits[offset+v] - maximum_logit) / normalizer - (v == target))
+        end
+    elseif threadIdx().x == 1
+        @inbounds losses[token] = target == ignore ? 0f0 :
+            maximum_logit + log(normalizer) - logits[offset+target]
+    end
+    nothing
+end
+
+Base.@constprop :aggressive function cross_entropy(logits::CuArray{Float32,3}, targets::CuArray, ignore, reduction)
+    losses = similar(logits,size(targets))
+    @cuda threads=256 blocks=length(targets) cross_entropy_kernel!(losses,nothing,logits,targets,nothing,ignore,Val(false))
+    reduction in (:sum,:mean) || return losses
+    total = sum(losses)
+    reduction == :mean ? total / sum(t -> t != ignore,targets) : total
+end
+
+function cross_entropy_gradient!(δ::CuArray{Float32}, logits::CuArray{Float32,3}, targets::CuArray, dy, ignore, reduction)
+    scale = reduction == :mean ? dy ./ sum(t -> t != ignore,targets; dims=(1,2)) : dy
+    @cuda threads=256 blocks=length(targets) cross_entropy_kernel!(nothing,δ,logits,targets,scale,ignore,Val(true))
+    nothing
+end
+
+function embedding_gradient_kernel!(δ, dy, tokens)
+    i = (blockIdx().x-1) * blockDim().x + threadIdx().x
+    if i <= length(dy)
+        D = size(δ,1)
+        token, d = divrem(i-1,D)
+        @inbounds CUDA.@atomic δ[d+1,tokens[token+1]] += dy[i]
+    end
+    nothing
+end
+
+function embedding_gradient!(δ::CuArray, dy::CuArray, tokens::CuArray)
+    @cuda threads=256 blocks=cld(length(dy),256) embedding_gradient_kernel!(δ,dy,tokens)
+    nothing
+end
+
+function batched_mul!(C::CuArray{F,3}, A::CuArray{F,3}, B::CuArray{F,3},
+                      transpose_A=false, transpose_B=false) where F
+    CUDA.CUBLAS.gemmStridedBatchedEx!(transpose_A ? 'T' : 'N', transpose_B ? 'T' : 'N',
+        1f0, A, B, 0f0, C)
+end
+
+function parameter_copy_kernel!(stack, vector, offsets, ::Val{Gather}) where Gather
+    i = (blockIdx().x-1) * blockDim().x + threadIdx().x
+    if i <= length(stack)
+        width = size(stack,1) * size(stack,2)
+        k, entry = divrem(i-1, width)
+        @inbounds if Gather
+            stack[i] = vector[offsets[k+1] + entry+1]
+        else
+            vector[offsets[k+1] + entry+1] = stack[i]
+        end
+    end
+    nothing
+end
+
+function gather!(stack::CuArray, vector::CuArray, offsets::CuArray)
+    @cuda threads=256 blocks=cld(length(stack),256) parameter_copy_kernel!(stack,vector,offsets,Val(true))
+    stack
+end
+
+function scatter!(vector::CuArray, stack::CuArray, offsets::CuArray)
+    @cuda threads=256 blocks=cld(length(stack),256) parameter_copy_kernel!(stack,vector,offsets,Val(false))
+    vector
+end
 using CUDA: i32
 using Core: BFloat16
 using FemtoChat

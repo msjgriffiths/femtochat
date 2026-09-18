@@ -6,13 +6,8 @@ using LinearAlgebra: mul!
 using Mooncake
 
 import FemtoChat: gradient_state, loss_and_gradient!
-import FemtoChat.GPT: apply_rotary_embedding,
-                      cross_entropy,
-                      leading_channels,
-                      norm,
-                      smear,
-                      smear_input
-import FemtoChat.Kernels: attention, attention_state, Δattention!
+import FemtoChat.GPT: apply_rotary_embedding, cross_entropy, norm
+import FemtoChat.Kernels: attention, attention_state, Δattention!, cross_entropy_gradient!
 using FemtoChat.Parameters: Embedding, GPTConfig, Linear, Params, paramview, 🤖
 using Mooncake: CoDual,
                 MinimalCtx,
@@ -24,7 +19,7 @@ using Mooncake: CoDual,
                 tangent,
                 zero_fcodual
 
-model_loss(model, tokens, targets) = sum(model(tokens, targets))
+model_loss(model, tokens, targets) = model(tokens, targets)
 
 struct MooncakeGradientState{M,C}
     model::M
@@ -103,87 +98,6 @@ function loss_and_gradient!(
     return loss
 end
 
-@is_primitive MinimalCtx Tuple{
-    typeof(smear),
-    CuArray{T,3},
-    CuArray{T,3},
-} where {T<:AbstractFloat}
-
-function smear_pullback!(x_gradient, gate_gradient, output_gradient, x, gate)
-    x_gradient .+= output_gradient
-    @views x_gradient[:, 1:end-1, :] .+=
-        output_gradient[:, 2:end, :] .* gate
-    @views gate_gradient .+= sum(
-        output_gradient[:, 2:end, :] .* x[:, 1:end-1, :];
-        dims=1,
-    )
-    return nothing
-end
-
-function Mooncake.rrule!!(
-    ::CoDual{typeof(smear)},
-    x::CoDual{<:CuArray{T,3},<:CuArray{T,3}},
-    gate::CoDual{<:CuArray{T,3},<:CuArray{T,3}},
-) where {T<:AbstractFloat}
-    primal_x, x_gradient = arrayify(x)
-    primal_gate, gate_gradient = arrayify(gate)
-    result = zero_fcodual(smear(primal_x, primal_gate))
-
-    function smear_pullback(::NoRData)
-        smear_pullback!(
-            x_gradient,
-            gate_gradient,
-            tangent(result),
-            primal_x,
-            primal_gate,
-        )
-        return NoRData(), NoRData(), NoRData()
-    end
-
-    return result, smear_pullback
-end
-
-@is_primitive MinimalCtx Tuple{
-    typeof(leading_channels),
-    CuArray{T,3},
-    Int,
-} where {T<:AbstractFloat}
-
-function Mooncake.rrule!!(
-    ::CoDual{typeof(leading_channels)},
-    x::CoDual{<:CuArray{T,3},<:CuArray{T,3}},
-    n::CoDual{Int,NoFData},
-) where {T<:AbstractFloat}
-    primal_x, gradient = arrayify(x)
-    result = zero_fcodual(leading_channels(primal_x, primal(n)))
-
-    function leading_channels_pullback(::NoRData)
-        @views gradient[1:primal(n), :, :] .+= tangent(result)
-        return NoRData(), NoRData(), NoRData()
-    end
-
-    return result, leading_channels_pullback
-end
-
-@is_primitive MinimalCtx Tuple{
-    typeof(smear_input),
-    CuArray{T,3},
-} where {T<:AbstractFloat}
-
-function Mooncake.rrule!!(
-    ::CoDual{typeof(smear_input)},
-    x::CoDual{<:CuArray{T,3},<:CuArray{T,3}},
-) where {T<:AbstractFloat}
-    primal_x, gradient = arrayify(x)
-    result = zero_fcodual(smear_input(primal_x))
-
-    function smear_input_pullback(::NoRData)
-        @views gradient[1:24, 2:end, :] .+= tangent(result)
-        return NoRData(), NoRData()
-    end
-
-    return result, smear_input_pullback
-end
 
 @is_primitive MinimalCtx Tuple{
     Linear{T,A},
@@ -401,46 +315,6 @@ end
     Symbol,
 } where {T<:AbstractFloat,I<:Integer}
 
-function target_gradient_kernel!(gradient, targets, scale, vocab_size, ignore_index)
-    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    if i <= length(targets)
-        target = @inbounds targets[i]
-        if target != ignore_index
-            @inbounds gradient[target + (i - 1) * vocab_size] -= scale[1]
-        end
-    end
-    return nothing
-end
-
-function cross_entropy_pullback!(
-    gradient,
-    logits,
-    targets,
-    loss_gradient,
-    ignore_index,
-)
-    V, T, B = size(logits)
-    valid = targets .!= ignore_index
-    count = sum(valid; dims=(1, 2))
-    scale = loss_gradient ./ count
-
-    maximum_logit = maximum(logits; dims=1)
-    probabilities = exp.(logits .- maximum_logit)
-    probabilities ./= sum(probabilities; dims=1)
-    gradient .+= probabilities .* reshape(valid, 1, T, B) .* scale
-
-    threads = min(length(targets), 256)
-    blocks = cld(length(targets), threads)
-    @cuda threads=threads blocks=blocks target_gradient_kernel!(
-        gradient,
-        targets,
-        scale,
-        V,
-        ignore_index,
-    )
-
-    return nothing
-end
 
 function Mooncake.rrule!!(
     ::CoDual{typeof(cross_entropy)},
@@ -449,8 +323,6 @@ function Mooncake.rrule!!(
     ignore_index::CoDual{Int,NoFData},
     reduction::CoDual{Symbol,NoFData},
 ) where {T<:AbstractFloat,I<:Integer}
-    primal(reduction) === :mean ||
-        throw(ArgumentError("the cross-entropy pullback requires reduction=:mean"))
     primal_logits, gradient = arrayify(logits)
     result = zero_fcodual(cross_entropy(
         primal_logits,
@@ -459,13 +331,14 @@ function Mooncake.rrule!!(
         primal(reduction),
     ))
 
-    function cross_entropy_pullback(::NoRData)
-        cross_entropy_pullback!(
+    function cross_entropy_pullback(dy)
+        cross_entropy_gradient!(
             gradient,
             primal_logits,
             primal(targets),
-            tangent(result),
+            dy isa NoRData ? tangent(result) : dy,
             primal(ignore_index),
+            primal(reduction),
         )
         return NoRData(), NoRData(), NoRData(), NoRData(), NoRData()
     end
