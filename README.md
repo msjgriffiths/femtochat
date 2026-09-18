@@ -9,7 +9,7 @@ The main dependencies are:
   * [Enzyme](https://github.com/EnzymeAD) for auto-differentiation. Enzyme (like tapanade) is a compiler-level autodiff engine, which supports custom rules (e.g. Flash Attention reverse) as well as other languages like Rust.
   * [Mooncake](https://github.com/chalk-lab/Mooncake.jl) as an alternative autodiff backend because my 5-year old Dell laptop I'm prototyping this on uses an ancient `GTX
 1050` that supports CUDA 11.1. Enzyme fails compilation. This requires quite a lot of additional backwards rules (which I've had Codex write). 
-  * [Reactant.jl] provides MLIR / XLA compilation, which is broadly similar to `torch.compile`. It provides a ~25% speed boost to plain Julia w/ Enzume. It remains about 5% slower than PyTorch. 
+  * [Reactant.jl](https://enzymead.github.io/Reactant.jl/stable/) provides MLIR / XLA compilation, which is broadly similar to `torch.compile`. It provides a ~25% speed boost to plain Julia w/ Enzume. It remains about 5% slower than PyTorch. 
   * [DuckDB](https://duckdb.org/) for handling Parquet files. 
   * [CUDA.jl](https://cuda.juliagpu.org/stable/) for running on GPUs.
 
@@ -56,21 +56,19 @@ let
     rng = Random.seed!(ReactantRNG(), 123)
     config = GPTConfig(sequence_len=4, vocab_size=16, n_layer=2, n_head=2, n_kv_head=1, n_embed=32, window_pattern="L")
     layout = parameter_layout(config)
-    # Create parameter and gradient vector on GPU device
+    # Create parameter and gradient vector on GPU
     params = Params(ConcreteRArray{Float32}(undef, layout.nparams))
     initialize!(params, layout, rng)
     model = 🤖(params, config, layout)
     tokens, targets = to_rarray.((Int32[1:4 2:5], Int32[2:5 3:6]))
     Nₜ = count(!=(-1), targets)
 
-    # Register Julia attention (~flash attention) with Reactant
+    # Register Julia implemtation of flash attention with Reactant
     extension = Base.get_extension(FemtoChat, :FemtoChatReactantExt)
     extension.prepare_attention(config, tokens)
 
     ℒ = (tokens, targets) -> model(tokens, targets; reduction=:sum)
-    ∇ℒ! = @compile sync=true ((tokens, targets) -> Enzyme.autodiff(
-        ReverseWithPrimal, Duplicated(ℒ, params), Active, Const(tokens), Const(targets),
-    ))(tokens, targets)
+    ∇ℒ! = @compile sync=true ((tokens, targets) -> Enzyme.autodiff(ReverseWithPrimal, Duplicated(ℒ, params), Active, Const(tokens), (targets),))(tokens, targets)
 
     η = .01f0
     (; Θ, δ) = params
