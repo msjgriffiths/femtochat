@@ -29,8 +29,8 @@ Example:
 """
 struct Params{
     T<:ParamFloat,
-    P<:AbstractVector{T},
-    G<:AbstractVector{Float32}
+    P<:AbstractVector,
+    G<:AbstractVector
 }
     Θ::P
     δ::G
@@ -131,6 +131,7 @@ struct Transformer{
 end
 
 struct 🤖{
+    P<:AbstractVector{<:Number},
     T<:Transformer,
     L<:Linear,
     W<:AbstractVector{Tuple{Int,Int}},
@@ -139,6 +140,7 @@ struct 🤖{
     BL<:AbstractVector{<:Number},
     R<:Tuple{AbstractMatrix{<:Number}, AbstractMatrix{<:Number}},
 }
+    Θ::P
     config::GPTConfig
 
     window_sizes::W
@@ -404,8 +406,8 @@ function rotary_embeddings(
     base::AbstractFloat = 100_000f0,
 ) where {A<:AbstractArray}
 
-    channel_range = A(undef, head_dim ÷ 2)
-    t = A(undef, seq_len)
+    channel_range = similar(A, (head_dim ÷ 2,))
+    t = similar(A, (seq_len,))
 
     # Mathematically these start at zero
     # We'll set up basic ranges and subtract 1 from them to get the correct values
@@ -472,6 +474,7 @@ function 🤖(
     )
 
     🤖(
+        Θ,
         config,
         window_sizes(config),
         layout.padded_vocab_size,

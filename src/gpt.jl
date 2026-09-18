@@ -162,9 +162,9 @@ Base.@constprop :aggressive function cross_entropy(logits::AbstractArray, target
     end
 end
 
-function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray)
+function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray; reduction=:mean)
     logits = ω(tokens)
-    cross_entropy(logits, targets)
+    cross_entropy(logits, targets; reduction)
 end
 
 function uniform!(ℛ, Θ::AbstractVector, spec::ParamSpec, low, high)
@@ -183,8 +183,10 @@ function normal!(ℛ, Θ::AbstractVector, spec::ParamSpec, standard_deviation)
     return nothing
 end
 
-function initialize!(params::Params, layout, ℛ = Random.default_rng())
-    (; Θ) = params
+initialize!(params::Params, layout, ℛ = Random.default_rng()) =
+    initialize!(params.Θ, layout, ℛ)
+
+function initialize!(Θ::AbstractVector, layout, ℛ = Random.default_rng())
     (; blocks, embedding) = layout.transformer
     (; lm_head, smear_gate, λₛ, λᵧ) = layout
     

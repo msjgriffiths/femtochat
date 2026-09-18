@@ -28,6 +28,8 @@ function gradient_state end
 ℒ(Θ, config, layout, tokens, targets) =
     🤖(Θ, config, layout)(tokens, targets)
 
+ℒ(ℳ::🤖, tokens, targets) = ℳ(tokens, targets)
+
 export Params,
        AdamW,
        Muon,
