@@ -93,12 +93,12 @@ function attention(Q::Reactant.AnyTracedRArray{F,4}, K::Reactant.AnyTracedRArray
     O
 end
 
-ℒ(Θ,config,layout,rope,tokens,targets) =
-    🤖(Θ,config,layout;rope_sin_cos=rope)(tokens,targets)
+ℒ(Θ,config,layout,rope,tokens,targets,positions=nothing) =
+    🤖(Θ,config,layout;rope_sin_cos=rope)(tokens,targets;positions)
 
-function gradient!(Θ,δ,config,layout,rope,tokens,targets)
+function gradient!(Θ,δ,config,layout,rope,tokens,targets,positions)
     result = Enzyme.gradient(ReverseWithPrimal,ℒ,Θ,Const(config),Const(layout),
-                             Const(rope),Const(tokens),Const(targets))
+                             Const(rope),Const(tokens),Const(targets),Const(positions))
     δ .= result.derivs[1]
     result.val
 end
@@ -112,20 +112,20 @@ end
 
 """Compile the GPU loss/gradient once for this token/batch shape; reuse `params.δ`."""
 function gradient_state(params::Params{Float32,<:Reactant.ConcreteRArray},
-                        config::GPTConfig, layout, tokens, targets)
+                        config::GPTConfig, layout, tokens, targets; positions=nothing)
     prepare_attention(config,tokens)
     # Layer metadata is static; weights and batches remain runtime arguments.
     layout = (;layout...,transformer=(;layout.transformer...,blocks=Tuple(layout.transformer.blocks)))
-    rope = rotary_embeddings(Vector{Float32},10config.sequence_len,config.n_embed ÷ config.n_head)
+    rope = rotary_embeddings(Vector{Float32},config.max_document_tokens,config.n_embed ÷ config.n_head)
     rope = Reactant.to_rarray(rope)
     (; Θ,δ) = params
-    compiled = Reactant.@compile sync=true gradient!(Θ,δ,config,layout,rope,tokens,targets)
+    compiled = Reactant.@compile sync=true gradient!(Θ,δ,config,layout,rope,tokens,targets,positions)
     ReactantGradientState(compiled,config,layout,rope)
 end
 
-function loss_and_gradient!(params::Params, state::ReactantGradientState, layout, tokens, targets)
+function loss_and_gradient!(params::Params, state::ReactantGradientState, layout, tokens, targets; positions=nothing)
     (; compiled,config,rope) = state
-    loss = compiled(params.Θ,params.δ,config,state.layout,rope,tokens,targets)
+    loss = compiled(params.Θ,params.δ,config,state.layout,rope,tokens,targets,positions)
     ReactantCUDACall.check()
     Float32(loss)
 end

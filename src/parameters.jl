@@ -17,6 +17,7 @@ export Params,
        paramview
 
 const ParamFloat = Union{Float32,BFloat16}
+const DEFAULT_MAX_DOCUMENT_TOKENS = 8192
 
 """
 Params implements a struct to hold the parameter vector and gradient vector for a neural
@@ -63,9 +64,13 @@ end
 """
 Configuration parameters for GPT model. These are used to determine how
     many parameters are in the model, and to map them to the parameter vector.
+
+`max_document_tokens` sets the precomputed RoPE table length, independently of
+`sequence_len`. Pass the same value to `DataLoader`; its cap includes BOS.
 """
 @kwdef struct GPTConfig
     sequence_len::Int = 2^11
+    max_document_tokens::Int = DEFAULT_MAX_DOCUMENT_TOKENS
     vocab_size::Int = 2^15
     n_layer::Int = 12
     n_head::Int = 6
@@ -439,7 +444,7 @@ function 🤖(
     Θ::AbstractVector{<:Number},
     config::GPTConfig,
     layout;
-    rope_sin_cos=rotary_embeddings(typeof(Θ),10config.sequence_len,config.n_embed ÷ config.n_head),
+    rope_sin_cos=rotary_embeddings(typeof(Θ),config.max_document_tokens,config.n_embed ÷ config.n_head),
 )
     length(Θ) == layout.nparams ||
         throw(DimensionMismatch(
@@ -486,7 +491,7 @@ function 🤖(
         λₛ,
         λᵧ,
 
-        10config.sequence_len,
+        size(first(rope_sin_cos), 2),
         rope_sin_cos
     )
 end

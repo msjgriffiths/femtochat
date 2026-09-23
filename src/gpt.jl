@@ -37,6 +37,19 @@ function (m::MLP)(x::AbstractArray)
     m.ℙ(x)
 end
 
+# RoPE tables are fixed metadata. Gather once per batch and share across layers.
+rotary_factors(sin_cos, ::Nothing) = sin_cos
+function rotary_factors(sin_cos, positions)
+    indices = positions .+ 1
+    map(sin_cos) do table
+        reshape(table[:, indices], size(table, 1), 1, size(positions, 1), size(positions, 2))
+    end
+end
+
+rotary_view(table::AbstractMatrix, T) =
+    reshape(@view(table[:, 1:T]), size(table, 1), 1, T, 1)
+rotary_view(factors::AbstractArray{<:Any,4}, T) = factors
+
 function apply_rotary_embedding(X, cos, sin)
     head_dim, n_head, T, B = size(X)
     d = head_dim ÷ 2
@@ -44,8 +57,8 @@ function apply_rotary_embedding(X, cos, sin)
     x₁ = @view X[1:d, :, :, :]
     x₂ = @view X[d+1:end, :, :, :]
 
-    c = reshape(@view(cos[:, 1:T]), d, 1, T, 1)
-    s = reshape(@view(sin[:, 1:T]), d, 1, T, 1)
+    c = rotary_view(cos, T)
+    s = rotary_view(sin, T)
 
     Y = similar(X)
 
@@ -92,14 +105,20 @@ function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Unio
     ℙ(y)
 end
 
-function (𝔹::Block)(x::AbstractArray, ve::Union{Nothing,AbstractArray} = nothing, sin_cos::Union{Nothing,Tuple{AbstractMatrix,AbstractMatrix}} = nothing)
+function (𝔹::Block)(x::AbstractArray, ve::Union{Nothing,AbstractArray} = nothing, sin_cos = nothing)
     x .+= 𝔹.👀(norm(x), sin_cos, ve) # Residual highway
     x .+= 𝔹.🧠(norm(x)) # Residual highway
 end
 
-function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
+"""
+Compute logits using optional zero-based document `positions`, shaped like `tokens`.
+Positions use the same device as the tokens and index the precomputed RoPE table.
+Omitting positions uses `0:sequence_length-1` in every batch column.
+"""
+function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}; positions=nothing)
     (; λᵧ, λₛ) = ω
     (; n_layer, vocab_size) = ω.config
+    sin_cos = rotary_factors(ω.rope_sin_cos, positions)
     x = ω.transformer.embed(tokens)
     x = norm(x)
 
@@ -120,7 +139,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix})
         # We pull out embedding matrix here because we have tokens here, instead of 
         # passing token indexes down. 
         ve = isnothing(🍰) ? nothing : 🍰(tokens)
-        x = block(x, ve, ω.rope_sin_cos)
+        x = block(x, ve, sin_cos)
         if i == backout_layer
             x_backout = x
         end
@@ -162,8 +181,8 @@ Base.@constprop :aggressive function cross_entropy(logits::AbstractArray, target
     end
 end
 
-function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray; reduction=:mean)
-    logits = ω(tokens)
+function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray; positions=nothing, reduction=:mean)
+    logits = ω(tokens; positions)
     cross_entropy(logits, targets; reduction)
 end
 

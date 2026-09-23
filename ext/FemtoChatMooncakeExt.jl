@@ -6,7 +6,7 @@ using LinearAlgebra: mul!
 using Mooncake
 
 import FemtoChat: gradient_state, loss_and_gradient!
-import FemtoChat.GPT: apply_rotary_embedding, cross_entropy, norm
+import FemtoChat.GPT: apply_rotary_embedding, cross_entropy, norm, rotary_factors, rotary_view
 import FemtoChat.Kernels: attention, attention_state, Δattention!, cross_entropy_gradient!
 using FemtoChat.Parameters: Embedding, GPTConfig, Linear, Params, paramview, 🤖
 using Mooncake: CoDual,
@@ -19,7 +19,9 @@ using Mooncake: CoDual,
                 tangent,
                 zero_fcodual
 
-model_loss(model, tokens, targets) = model(tokens, targets)
+model_loss(model, tokens, targets, positions) = model(tokens, targets; positions)
+
+Mooncake.@zero_derivative MinimalCtx Tuple{typeof(rotary_factors), Tuple, Any}
 
 struct MooncakeGradientState{M,C}
     model::M
@@ -32,10 +34,11 @@ function gradient_state(
     config::GPTConfig,
     layout,
     tokens,
-    targets,
+    targets;
+    positions=nothing,
 ) where {T,P<:CuArray}
     model = 🤖(params, config, layout)
-    cache = prepare_gradient_cache(model_loss, model, tokens, targets)
+    cache = prepare_gradient_cache(model_loss, model, tokens, targets, positions)
     MooncakeGradientState(model, cache)
 end
 
@@ -85,7 +88,8 @@ function loss_and_gradient!(
     state::MooncakeGradientState,
     layout,
     tokens,
-    targets,
+    targets;
+    positions=nothing,
 ) where {T,P<:CuArray}
     loss, gradients = value_and_gradient!!(
         state.cache,
@@ -93,6 +97,7 @@ function loss_and_gradient!(
         state.model,
         tokens,
         targets,
+        positions,
     )
     flatten_gradient!(params.δ, gradients[2], layout)
     return loss
@@ -140,9 +145,9 @@ end
 @is_primitive MinimalCtx Tuple{
     typeof(apply_rotary_embedding),
     CuArray{T,4},
-    CuArray{T,2},
-    CuArray{T,2},
-} where {T<:AbstractFloat}
+    CuArray{T,N},
+    CuArray{T,N},
+} where {T<:AbstractFloat,N}
 
 function rotary_pullback!(gradient, output_gradient, cos, sin)
     d = size(gradient, 1) ÷ 2
@@ -152,8 +157,8 @@ function rotary_pullback!(gradient, output_gradient, cos, sin)
     x₂ = @view gradient[d+1:end, :, :, :]
     y₁ = @view output_gradient[1:d, :, :, :]
     y₂ = @view output_gradient[d+1:end, :, :, :]
-    c = reshape(@view(cos[:, 1:T]), d, 1, T, 1)
-    s = reshape(@view(sin[:, 1:T]), d, 1, T, 1)
+    c = rotary_view(cos, T)
+    s = rotary_view(sin, T)
 
     @. x₁ += y₁ * c - y₂ * s
     @. x₂ += y₁ * s + y₂ * c
@@ -163,9 +168,9 @@ end
 function Mooncake.rrule!!(
     ::CoDual{typeof(apply_rotary_embedding)},
     x::CoDual{<:CuArray{T,4},<:CuArray{T,4}},
-    cos::CoDual{<:CuArray{T,2},<:CuArray{T,2}},
-    sin::CoDual{<:CuArray{T,2},<:CuArray{T,2}},
-) where {T<:AbstractFloat}
+    cos::CoDual{<:CuArray{T,N},<:CuArray{T,N}},
+    sin::CoDual{<:CuArray{T,N},<:CuArray{T,N}},
+) where {T<:AbstractFloat,N}
     primal_x, gradient = arrayify(x)
     result = zero_fcodual(apply_rotary_embedding(
         primal_x,

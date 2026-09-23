@@ -44,8 +44,10 @@ function generate(
         context = @view tokens[first_token:end]
         input = similar(model.λₛ, Int32, length(context), 1)
         copyto!(input, reshape(Int32.(context), :, 1))
+        positions = similar(input)
+        copyto!(positions, reshape(Int32.(first_token-1:length(tokens)-1), :, 1))
 
-        logits = Array(model(input))[:, end, 1]
+        logits = Array(model(input; positions))[:, end, 1]
         token = sample_token(rng, logits, temperature, top_k)
         push!(tokens, convert(eltype(tokens), token))
     end

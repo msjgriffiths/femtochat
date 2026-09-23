@@ -5,14 +5,17 @@ using FemtoChat
 
 import FemtoChat: loss_and_gradient!, gradient_state
 import FemtoChat.Kernels: attention, attention_state, Δattention!
-import FemtoChat.GPT: softcap, relu², apply_rotary_embedding
+import FemtoChat.GPT: softcap, relu², apply_rotary_embedding, rotary_factors, rotary_view
 import FemtoChat.Kernels: embedding_gradient!
 using FemtoChat.Parameters: Params, GPTConfig, Linear, Embedding, MLP, 🤖
 using LinearAlgebra: mul!
 
 const Rules = Enzyme.EnzymeRules
 
-model_loss(model, tokens, targets) = model(tokens, targets)
+model_loss(model, tokens, targets, positions) = model(tokens, targets; positions)
+
+# Precomputed angles and integer positions are not learned parameters.
+Rules.inactive(::typeof(rotary_factors), args...) = true
 
 struct EnzymeGradientState{M,F,R}
     model::M
@@ -21,20 +24,20 @@ struct EnzymeGradientState{M,F,R}
 end
 
 """Prepare Enzyme once; parameter tangents are views into `params.δ`."""
-function gradient_state(params::Params{Float32}, config::GPTConfig, layout, tokens, targets)
+function gradient_state(params::Params{Float32}, config::GPTConfig, layout, tokens, targets; positions=nothing)
     model = 🤖(params,config,layout)
     # Shared read-only RoPE buffers are inactive under Enzyme's runtime activity.
     shadow = 🤖(params.δ,config,layout; rope_sin_cos=model.rope_sin_cos)
     model = Duplicated(model,shadow)
     mode = Enzyme.set_runtime_activity(Enzyme.ReverseSplitWithPrimal)
     forward, reverse = Enzyme.autodiff_thunk(mode,Const{typeof(model_loss)},Active,
-        typeof(model),typeof(Const(tokens)),typeof(Const(targets)))
+        typeof(model),typeof(Const(tokens)),typeof(Const(targets)),typeof(Const(positions)))
     EnzymeGradientState(model,forward,reverse)
 end
 
-function loss_and_gradient!(params::Params, state::EnzymeGradientState, layout, tokens, targets)
+function loss_and_gradient!(params::Params, state::EnzymeGradientState, layout, tokens, targets; positions=nothing)
     fill!(params.δ,0f0)
-    args = (Const(model_loss),state.model,Const(tokens),Const(targets))
+    args = (Const(model_loss),state.model,Const(tokens),Const(targets),Const(positions))
     tape, loss, _ = state.forward(args...)
     state.reverse(args...,one(loss),tape)
     loss
@@ -150,15 +153,17 @@ function Rules.reverse(config::Rules.RevConfigWidth{1}, ::Const{typeof(apply_rot
     d, T = size(x.val,1) ÷ 2, size(x.val,3)
     (; dy) = tape
     @views begin
-        c = reshape(tape.c[:,1:T], d,1,T,1)
-        s = reshape(tape.s[:,1:T], d,1,T,1)
+        c = rotary_view(tape.c, T)
+        s = rotary_view(tape.s, T)
         if cos isa Duplicated && !(Rules.runtime_activity(config) && cos.val === cos.dval)
-            cos.dval[:,1:T] .+= reshape(sum(dy[1:d,:,:,:] .* tape.x[1:d,:,:,:] .+
-                dy[d+1:end,:,:,:] .* tape.x[d+1:end,:,:,:]; dims=(2,4)),d,T)
+            dims = size(c,4) == 1 ? (2,4) : (2,)
+            rotary_view(cos.dval, T) .+= sum(dy[1:d,:,:,:] .* tape.x[1:d,:,:,:] .+
+                dy[d+1:end,:,:,:] .* tape.x[d+1:end,:,:,:]; dims)
         end
         if sin isa Duplicated && !(Rules.runtime_activity(config) && sin.val === sin.dval)
-            sin.dval[:,1:T] .+= reshape(sum(dy[1:d,:,:,:] .* tape.x[d+1:end,:,:,:] .-
-                dy[d+1:end,:,:,:] .* tape.x[1:d,:,:,:]; dims=(2,4)),d,T)
+            dims = size(s,4) == 1 ? (2,4) : (2,)
+            rotary_view(sin.dval, T) .+= sum(dy[1:d,:,:,:] .* tape.x[d+1:end,:,:,:] .-
+                dy[d+1:end,:,:,:] .* tape.x[1:d,:,:,:]; dims)
         end
         x.dval[1:d,:,:,:] .+= dy[1:d,:,:,:] .* c .- dy[d+1:end,:,:,:] .* s
         x.dval[d+1:end,:,:,:] .+= dy[1:d,:,:,:] .* s .+ dy[d+1:end,:,:,:] .* c
@@ -280,10 +285,11 @@ function loss_and_gradient!(
     config::GPTConfig,
     layout,
     tokens,
-    targets,
+    targets;
+    positions=nothing,
 )
-    state = gradient_state(params,config,layout,tokens,targets)
-    loss_and_gradient!(params,state,layout,tokens,targets)
+    state = gradient_state(params,config,layout,tokens,targets; positions)
+    loss_and_gradient!(params,state,layout,tokens,targets; positions)
 end
 
 end

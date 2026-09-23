@@ -14,8 +14,10 @@ function evaluate_bpb(
     total_nats = nothing
     total_bytes = nothing
 
-    for (tokens, targets) in take(batches, steps)
-        losses = cross_entropy(model(tokens), targets; reduction=:none)
+    for batch in take(batches, steps)
+        tokens, targets = batch
+        logits = hasproperty(batch, :positions) ? model(tokens; positions=batch.positions) : model(tokens)
+        losses = cross_entropy(logits, targets; reduction=:none)
 
         valid = targets .!= -1
         safe_targets = ifelse.(valid, targets, one(eltype(targets)))

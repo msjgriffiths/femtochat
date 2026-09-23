@@ -5,6 +5,7 @@ using DBInterface: connect, execute
 using Tables: rows
 using ..Dataset: MAX_SHARD
 using ..Tokenizer: bos_token_id
+using ..Parameters: DEFAULT_MAX_DOCUMENT_TOKENS
 
 export DataLoader,
        DataLoaderState,
@@ -27,8 +28,6 @@ struct DataLoaderState
 end
 
 DataLoaderState() = DataLoaderState(1, 1, 1)
-
-const DEFAULT_MAX_DOCUMENT_TOKENS = 8192
 
 """
     DataLoader(files; max_document_tokens=8192, kwargs...)
@@ -165,8 +164,8 @@ Each slot continues its document in the next batch. At an epoch boundary,
 active documents finish before the next epoch starts; unused slots are padded.
 Only the first `loader.max_document_tokens` tokens of each BOS-prefixed document
 are retained, yielding at most `loader.max_document_tokens - 1` targets.
-Existing `(tokens, targets)` destructuring remains supported. Positions are
-metadata for a future model change; they are not yet passed to RoPE.
+Pass positions to the model with `model(tokens, targets; positions)`.
+Existing `(tokens, targets)` destructuring remains supported.
 
 Resume with `state=batch_state(previous_batches)`. The snapshot includes
 active token vectors and requires the same files, rank, batch size, sequence

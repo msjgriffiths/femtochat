@@ -25,10 +25,10 @@ using .Common
 function loss_and_gradient! end
 function gradient_state end
 
-ℒ(Θ, config, layout, tokens, targets) =
-    🤖(Θ, config, layout)(tokens, targets)
+ℒ(Θ, config, layout, tokens, targets; positions=nothing) =
+    🤖(Θ, config, layout)(tokens, targets; positions)
 
-ℒ(ℳ::🤖, tokens, targets) = ℳ(tokens, targets)
+ℒ(ℳ::🤖, tokens, targets; positions=nothing) = ℳ(tokens, targets; positions)
 
 export Params,
        AdamW,
