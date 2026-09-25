@@ -7,6 +7,7 @@ using Mooncake
 
 import FemtoChat: gradient_state, loss_and_gradient!
 import FemtoChat.GPT: apply_rotary_embedding, cross_entropy, norm, rotary_factors, rotary_view
+import FemtoChat.GPT: smear_embeddings
 import FemtoChat.Kernels: attention, attention_state, Δattention!, cross_entropy_gradient!
 using FemtoChat.Parameters: Embedding, GPTConfig, Linear, Params, paramview, 🤖
 using Mooncake: CoDual,
@@ -22,6 +23,54 @@ using Mooncake: CoDual,
 model_loss(model, tokens, targets, positions) = model(tokens, targets; positions)
 
 Mooncake.@zero_derivative MinimalCtx Tuple{typeof(rotary_factors), Tuple, Any}
+
+# The smear and value gates slice dense feature/token ranges. Differentiate the
+# slice itself instead of tracing CUDA's kernel compiler for that indexing call.
+const DenseSlice = Union{Colon,UnitRange{Int}}
+@is_primitive MinimalCtx Tuple{
+    typeof(getindex), CuArray{T,3}, DenseSlice, DenseSlice, Colon,
+} where {T<:AbstractFloat}
+
+function Mooncake.rrule!!(
+    ::CoDual{typeof(getindex)},
+    x::CoDual{<:CuArray{T,3}},
+    rows::CoDual{<:DenseSlice},
+    columns::CoDual{<:DenseSlice},
+    batches::CoDual{Colon},
+) where {T<:AbstractFloat}
+    px, dx = arrayify(x)
+    indices = (primal(rows), primal(columns), primal(batches))
+    result = zero_fcodual(px[indices...])
+    function slice_pullback(::NoRData)
+        view(dx, indices...) .+= tangent(result)
+        return NoRData(), NoRData(), NoRData(), NoRData(), NoRData()
+    end
+    result, slice_pullback
+end
+
+# Updating a noncontiguous token view is outside Mooncake's CuArray broadcast
+# rule. Keep this small operation as one primitive with its own GPU pullback.
+@is_primitive MinimalCtx Tuple{
+    typeof(smear_embeddings), CuArray{T,3}, CuArray{T,3},
+} where {T<:AbstractFloat}
+
+function Mooncake.rrule!!(
+    ::CoDual{typeof(smear_embeddings)},
+    x::CoDual{<:CuArray{T,3}},
+    gate::CoDual{<:CuArray{T,3}},
+) where {T<:AbstractFloat}
+    px, dx = arrayify(x)
+    pg, dg = arrayify(gate)
+    result = zero_fcodual(smear_embeddings(px, pg))
+    function smear_pullback(::NoRData)
+        dy = tangent(result)
+        dx .+= dy
+        @views dx[:, 1:end-1, :] .+= dy[:, 2:end, :] .* pg
+        @views dg .+= sum(dy[:, 2:end, :] .* px[:, 1:end-1, :]; dims=1)
+        return NoRData(), NoRData(), NoRData()
+    end
+    result, smear_pullback
+end
 
 struct MooncakeGradientState{M,C}
     model::M

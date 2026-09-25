@@ -60,18 +60,61 @@ function cross_entropy_gradient!(δ::CuArray{Float32}, logits::CuArray{Float32,3
     nothing
 end
 
+function embedding_kernel!(y, weights, tokens)
+    i = (blockIdx().x-1) * blockDim().x + threadIdx().x
+    if i <= length(y)
+        token,d = divrem(i-1,size(weights,1))
+        @inbounds y[i] = weights[d+1,tokens[token+1]]
+    end
+    nothing
+end
+
+function embedding!(y::CuArray, weights::CuArray, tokens::CuArray)
+    @cuda threads=256 blocks=cld(length(y),256) embedding_kernel!(y,weights,tokens)
+    nothing
+end
+
 function embedding_gradient_kernel!(δ, dy, tokens)
     i = (blockIdx().x-1) * blockDim().x + threadIdx().x
     if i <= length(dy)
         D = size(δ,1)
         token, d = divrem(i-1,D)
-        @inbounds CUDA.@atomic δ[d+1,tokens[token+1]] += dy[i]
+        @inbounds value = dy[i]
+        # Masked targets produce zero adjoints. Avoid contended atomics for padding.
+        if !iszero(value)
+            @inbounds CUDA.@atomic δ[d+1,tokens[token+1]] += value
+        end
     end
     nothing
 end
 
 function embedding_gradient!(δ::CuArray, dy::CuArray, tokens::CuArray)
     @cuda threads=256 blocks=cld(length(dy),256) embedding_gradient_kernel!(δ,dy,tokens)
+    nothing
+end
+
+# Final optimizer writes. Moments and Muon's direction are computed by Reactant.
+# α includes the first-moment bias correction; β is the second-moment correction.
+# η is the uncorrected learning rate used for weight decay.
+function adam_update_kernel!(Θ,𝓂,𝓋,α,β,η,::Val{Meta}) where Meta
+    offset,λ,ϵ = Meta
+    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
+    if i <= length(𝓂)
+        @inbounds Θ[offset+i] = Θ[offset+i]*(1f0-η[1]*λ) - α[1]*𝓂[i]/(sqrt(𝓋[i]/β[1])+ϵ)
+    end
+    nothing
+end
+
+function muon_update_kernel!(Θ,X,η,λ,offsets)
+    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
+    k, width = blockIdx().y, size(X,1)*size(X,2)
+    if i <= width
+        @inbounds begin
+            index = offsets[k]+i
+            x = X[i+(k-1)*width]
+            Θ[index] -= η[1]*x + η[1]*λ[1]*Θ[index]*(x*Θ[index] ≥ 0)
+        end
+    end
     nothing
 end
 
@@ -760,6 +803,7 @@ function Δflash_attention₁!(
     @cuda threads=layout.threads blocks=(cld(T,layout.threads÷32),H,B) flash_attention₁_rows!(Δ, dO, O)
     @cuda threads=layout.threads blocks=(cld(T,Bᶜ),size(K,2),B) shmem=sizeof(Float32)*shared fastmath=true Δflash_attention₁_kernel!(
         dQ, dK, dV, dO, Q, K, V, ℓ, m, Δ, Val(window), Val(layout), Val(query_layout))
+    CUDA.unsafe_free!(Δ)
     return nothing
 end
 
@@ -1704,8 +1748,8 @@ end
     Δattention!(::TensorCoreInstruction,dQ,dK,dV,dO,Q,K,V,O,ℓ,m,window;
                 accumulate=true,warps=nothing,query_tile=nothing,head_span=nothing)
 
-One tiled Tensor Core backward. Q/K/V are Float16 or BFloat16; O/dO/dQ/dK/dV
-share that format or Float32 storage. Statistics, atomics, and partial KV sums remain
+One tiled Tensor Core backward. Q/K/V are Float16 or BFloat16. O/dO and dQ/dK/dV
+can independently use that format or Float32. Statistics, atomics, and partial KV sums remain
 Float32. Float32 upstream retains GPU power-of-two scaling; 16-bit upstream is
 consumed directly, with its explicit representability and underflow limits.
 
@@ -1725,11 +1769,11 @@ causal (-1,0), and nonnegative local extents. Scratch is linear in sequence
 length. dQ is numerically reproducible, not bitwise deterministic.
 """
 function Δattention!(::TensorCoreInstruction,
-    dQ::CuArray{F,4},dK::CuArray{F,4},dV::CuArray{F,4},dO::CuArray{F,4},
+    dQ::CuArray{F,4},dK::CuArray{F,4},dV::CuArray{F,4},dO::CuArray{G,4},
     Q::CuArray{E,4},K::CuArray{E,4},V::CuArray{E,4},
-    O::CuArray{F,4},ℓ::CuArray{Float32,4},m::CuArray{Float32,4},window::Tuple{Int,Int};
+    O::CuArray{G,4},ℓ::CuArray{Float32,4},m::CuArray{Float32,4},window::Tuple{Int,Int};
     accumulate::Bool=true,warps=nothing,query_tile=nothing,head_span=nothing,
-) where {E<:TensorFloat,F<:Union{E,Float32}}
+) where {E<:TensorFloat,F<:Union{E,Float32},G<:Union{E,Float32}}
     D,H,T,B = size(Q)
     dev = device(Q)
     budget = attribute(dev,CUDA.DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
@@ -1771,6 +1815,13 @@ function launch_gradient!(dQ,dK,dV,dO,Q,K,V,O,ℓ,m,window,
     if Span!=groups
         @cuda threads=256 blocks=cld(length(dK),256) reduce_heads!(
             dK,dV,δK,δV,s,Val(groups÷Span),Val(D),policy)
+        foreach(CUDA.unsafe_free!,(δK,δV))
+    end
+    # Release scratch on its live stream, before XLA can destroy that context.
+    foreach(CUDA.unsafe_free!,(Δ,L,δQ))
+    if dO₁₆ !== dO
+        CUDA.unsafe_free!(dO₁₆)
+        CUDA.unsafe_free!(s)
     end
     nothing
 end

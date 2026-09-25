@@ -15,23 +15,30 @@ const errors = Any[]
 @generated borrowed_stream(handle::StreamHandle, ctx::CUDA.CuContext) =
     Expr(:new, CUDA.CuStream, :handle, true, :ctx)
 
+function launch_buffers(f,::Val{Types},::Val{Shapes},::Val{N},buffers) where {Types,Shapes,N}
+    arrays = ntuple(Val(length(Shapes))) do i
+        T,shape = fieldtype(Types,i),Shapes[i]
+        ptr = reinterpret(CUDA.CuPtr{T},UInt(unsafe_load(buffers,i)))
+        unsafe_wrap(CUDA.CuArray,ptr,shape;own=false)
+    end
+    f(arrays[N+1:end]...,arrays[1:N]...)
+end
+
 function register(f, outputs, inputs)
     get!(registry, (f,outputs,inputs)) do
         # The plug-in uses the compiler ABI, not a stable external C API.
-        basename(Reactant.Reactant_jll.artifact_dir) == "8c901360b3c2781fba15e2fd43a05a4387462577" ||
-            error("Rebuild the attention plug-in for this Reactant_jll artifact; see deps/reactant/README.md")
+        artifact = joinpath(dirname(libffi),"artifact.txt")
+        isfile(artifact) && strip(read(artifact,String)) == basename(Reactant.Reactant_jll.artifact_dir) ||
+            error("Rebuild the Reactant adapters with deps/reactant/build.sh")
         ctx = CUDA.context()
         specs = (inputs...,outputs...)
-        n = length(inputs)
+        # Keep buffer arguments a typed tuple rather than a dynamically typed vector.
+        types,shapes,n = Val(Tuple{first.(specs)...}),Val(last.(specs)),Val(length(inputs))
         function launch(stream, buffers)
             try
                 CUDA.context!(ctx) do
                     CUDA.stream!(borrowed_stream(stream,ctx)) do
-                        arrays = map(enumerate(specs)) do (i,(T,shape))
-                            ptr = reinterpret(CUDA.CuPtr{T},UInt(unsafe_load(buffers,i)))
-                            unsafe_wrap(CUDA.CuArray,ptr,shape;own=false)
-                        end
-                        f(arrays[n+1:end]...,arrays[1:n]...)
+                        launch_buffers(f,types,shapes,n,buffers)
                     end
                 end
                 return true
@@ -49,7 +56,7 @@ function register(f, outputs, inputs)
     end
 end
 
-function call(f,outputs,args...;vjp=nothing)
+function call(f,outputs,args...;vjp=nothing,alias_input=nothing)
     inputs = map(x -> (Reactant.unwrapped_eltype(typeof(x)),size(x)),args)
     # Callback creation belongs to state preparation, never the tracing context.
     entry = registry[(f,outputs,inputs)]
@@ -60,17 +67,21 @@ function call(f,outputs,args...;vjp=nothing)
         backend_config=Dict("callback_ptr" => IR.Attribute(Int64(UInt(Base.unsafe_convert(Ptr{Cvoid},entry.callback))))),
         operand_layouts=Reactant.Ops._col_major_layout(inputs),
         result_layouts=Reactant.Ops._col_major_layout(outputs))
+    if alias_input !== nothing
+        alias = parse(IR.Attribute,"#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = $alias_input, operand_tuple_indices = []>")
+        IR.setattr!(op,"output_operand_aliases",IR.Attribute([alias]))
+    end
     if vjp !== nothing
         # Attach a reverse recipe to this operation, not to the whole loss.
         reverse_inputs = (outputs[1],inputs...,outputs...)
-        reverse_outputs = map(spec -> (Float32,spec[2]),inputs)
+        reverse_outputs = Tuple(spec for spec in inputs if first(spec) <: AbstractFloat)
         reverse = registry[(vjp,reverse_outputs,reverse_inputs)]
         IR.setattr!(op,"femtochat.backward_target",IR.Attribute(reverse.name))
         IR.setattr!(op,"femtochat.backward_config",IR.Attribute(Dict(
             "callback_ptr" => IR.Attribute(Int64(UInt(Base.unsafe_convert(Ptr{Cvoid},reverse.callback)))))))
         IR.setattr!(op,"femtochat.backward_operand_layouts",IR.Attribute(Reactant.Ops._col_major_layout(reverse_inputs)))
         IR.setattr!(op,"femtochat.backward_result_layouts",IR.Attribute(Reactant.Ops._col_major_layout(reverse_outputs)))
-        ok = ccall((:register_femtochat_attention_rule,librule),Bool,
+        ok = ccall((:register_femtochat_typed_reverse_rule,librule),Bool,
                    (Reactant.MLIR.API.MlirContext,),IR.context(op))
         @assert ok "Could not attach the Enzyme-MLIR reverse interface"
     end
@@ -83,5 +94,9 @@ Reactant.@skip_rewrite_func call
 function check()
     isempty(errors) || throw(first(errors)[1])
     nothing
+end
+
+function __init__()
+    Reactant.@skip_rewrite_func call
 end
 end
