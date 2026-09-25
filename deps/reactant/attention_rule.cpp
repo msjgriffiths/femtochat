@@ -1,5 +1,5 @@
-// Enzyme-MLIR reverse interface for the existing attention custom call.
-// This is compiler glue: no numerical attention code and no GPU runtime work.
+// Enzyme-MLIR reverse interface for registered CUDA calls.
+// This is compiler glue: no numerical kernels and no GPU runtime work.
 #include "mlir/CAPI/IR.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -11,7 +11,7 @@ using namespace mlir;
 using namespace mlir::enzyme;
 
 namespace {
-struct AttentionReverse : ReverseAutoDiffOpInterface::FallbackModel<AttentionReverse> {
+struct CUDAReverse : ReverseAutoDiffOpInterface::FallbackModel<CUDAReverse> {
     LogicalResult createShadowValues(Operation*, OpBuilder&, MGradientUtilsReverse*) const {
         return success(); // Ranked tensors are immutable SSA values.
     }
@@ -21,7 +21,7 @@ struct AttentionReverse : ReverseAutoDiffOpInterface::FallbackModel<AttentionRev
         if (!op->hasAttr("femtochat.backward_target")) return caches;
         OpBuilder builder(g->getNewFromOriginal(op));
         builder.setInsertionPointAfter(g->getNewFromOriginal(op));
-        // Q, K, V and the forward O, normalization sum, and maximum.
+        // Save inputs and forward results for the registered reverse callback.
         for (Value v : op->getOperands())
             caches.push_back(g->initAndPushCache(g->getNewFromOriginal(v), builder));
         for (Value v : op->getResults())
@@ -43,7 +43,7 @@ struct AttentionReverse : ReverseAutoDiffOpInterface::FallbackModel<AttentionRev
         SmallVector<Type> types;
         for (Value input : op->getOperands()) {
             auto type = cast<RankedTensorType>(input.getType());
-            types.push_back(RankedTensorType::get(type.getShape(), builder.getF32Type()));
+            if (isa<FloatType>(type.getElementType())) types.push_back(type);
         }
         OperationState state(op->getLoc(), "stablehlo.custom_call");
         state.addOperands(args);
@@ -55,26 +55,23 @@ struct AttentionReverse : ReverseAutoDiffOpInterface::FallbackModel<AttentionRev
         state.addAttribute("operand_layouts", op->getAttr("femtochat.backward_operand_layouts"));
         state.addAttribute("result_layouts", op->getAttr("femtochat.backward_result_layouts"));
         Operation* reverse = builder.create(state);
-        for (auto [input, derivative] : llvm::zip(op->getOperands(), reverse->getResults())) {
+        unsigned index = 0;
+        for (Value input : op->getOperands()) {
+            auto type = cast<RankedTensorType>(input.getType());
+            if (!isa<FloatType>(type.getElementType())) continue;
+            Value derivative = reverse->getResult(index++);
             if (g->isConstantValue(input)) continue;
-            Value dx = derivative;
-            if (dx.getType() != input.getType()) {
-                OperationState conversion(op->getLoc(), "stablehlo.convert");
-                conversion.addOperands(dx);
-                conversion.addTypes(input.getType());
-                dx = builder.create(conversion)->getResult(0);
-            }
-            g->addToDiffe(input, dx, builder);
+            g->addToDiffe(input, derivative, builder);
         }
         return success();
     }
 };
 }
 
-extern "C" bool register_femtochat_attention_rule(MlirContext context) {
+extern "C" bool register_femtochat_typed_reverse_rule(MlirContext context) {
     auto op = RegisteredOperationName::lookup("stablehlo.custom_call", unwrap(context));
     if (!op) return false;
     if (!op->hasInterface<ReverseAutoDiffOpInterface>())
-        op->attachInterface<AttentionReverse>();
+        op->attachInterface<CUDAReverse>();
     return true;
 }

@@ -80,4 +80,5 @@ done
     -Wl,-rpath,"$(dirname "$lib")" -o libreactant_attention_rule.so
 # Keep existing adapters in place if either compilation fails.
 mv libreactant_xla_ffi.so libreactant_attention_rule.so "$root/"
+basename "$(dirname "$(dirname "$lib")")" > "$root/artifact.txt"
 printf 'Reactant adapters built in %s\n' "$root"
