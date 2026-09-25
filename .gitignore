@@ -4,3 +4,6 @@ checkpoints/
 wandb/
 runs/
 __pycache__/
+deps/reactant/*.so
+deps/reactant/build/
+deps/reactant/artifact.txt
