@@ -13,9 +13,10 @@ softcap(x, c=15f0) = @. c * tanh(x / c)
 relu²(x) = max.(x, zero(eltype(x))) .^ 2
 const Σ = sum
 
-function norm(x, ϵ=eps(Float32))
+function norm(x, ϵ=eps(eltype(x)))
     D = size(x, 1) # Since we're column orientated, first dimension is token embedding size
-    x ./ sqrt.(Σ(abs2, x; dims=1) ./ D .+ ϵ)
+    F = promote_type(eltype(x), Float32) # At least FP32 accumulation; preserve activation type.
+    eltype(x).(x ./ sqrt.(Σ(x -> abs2(F(x)), x; dims=1) ./ D .+ ϵ))
 end
  ∥(x) = norm(x)
 
@@ -23,7 +24,8 @@ function (ℓ::Linear)(x::AbstractArray)
     Din = size(x, 1)
 
     X = reshape(x, Din, :)
-    Y = ℓ.𝕎 * X
+    W = eltype(x) == eltype(ℓ.𝕎) ? ℓ.𝕎 : eltype(x).(ℓ.𝕎)
+    Y = W * X
 
     reshape(Y, size(ℓ.𝕎, 1), Base.tail(size(x))...)
 end
@@ -59,6 +61,9 @@ function apply_rotary_embedding(X, cos, sin)
 
     c = rotary_view(cos, T)
     s = rotary_view(sin, T)
+    if eltype(c) != eltype(X)
+        c, s = eltype(X).(c), eltype(X).(s)
+    end
 
     Y = similar(X)
 
@@ -72,7 +77,7 @@ function apply_rotary_embedding(X, cos, sin)
 end
 
 
-function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Union{Nothing,AbstractArray} = nothing)
+function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Union{Nothing,AbstractArray} = nothing; attention_options=(;))
     # TODO: Implement causal self-attention with value embedding and rotary embedding and kb cache
 
     (; 𝕎, 𝕂, 𝕍, ℙ, 𝕧𝕖, head_dim, n_head, n_kv_head, window) = 👀
@@ -97,17 +102,23 @@ function(👀::CausalSelfAttention)(x::AbstractArray{<:Any,3}, sin_cos, ve::Unio
     rope_sin, rope_cos = sin_cos
     Q = apply_rotary_embedding(Q, rope_cos, rope_sin)
     K = apply_rotary_embedding(K, rope_cos, rope_sin)
-    Q = norm(Q) .* 1.2f0
-    K = norm(K) .* 1.2f0
+    Q = eltype(Q).(norm(Q) .* 1.2f0)
+    K = eltype(K).(norm(K) .* 1.2f0)
 
-    y = attention(Q, K, V, window)
+    y = attention(Q, K, V, window; attention_options...)
     y = reshape(y, C, T, B)
     ℙ(y)
 end
 
-function (𝔹::Block)(x::AbstractArray, ve::Union{Nothing,AbstractArray} = nothing, sin_cos = nothing)
-    x .+= 𝔹.👀(norm(x), sin_cos, ve) # Residual highway
+function (𝔹::Block)(x::AbstractArray, ve::Union{Nothing,AbstractArray} = nothing, sin_cos = nothing; attention_options=(;))
+    x .+= 𝔹.👀(norm(x), sin_cos, ve; attention_options) # Residual highway
     x .+= 𝔹.🧠(norm(x)) # Residual highway
+end
+
+function smear_embeddings(x, gate)
+    y = copy(x)
+    @views y[:, 2:end, :] .+= gate .* x[:, 1:end-1, :]
+    y
 end
 
 """
@@ -115,18 +126,18 @@ Compute logits using optional zero-based document `positions`, shaped like `toke
 Positions use the same device as the tokens and index the precomputed RoPE table.
 Omitting positions uses `0:sequence_length-1` in every batch column.
 """
-function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}; positions=nothing)
+function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}; positions=nothing, attention_options=(;))
     (; λᵧ, λₛ) = ω
+    F = ω.compute_type
     (; n_layer, vocab_size) = ω.config
     sin_cos = rotary_factors(ω.rope_sin_cos, positions)
     x = ω.transformer.embed(tokens)
+    eltype(x) == F || (x = F.(x))
     x = norm(x)
 
     # Smear token embeddings together for cheap bigram information
     gate = λₛ .* σ(ω.smear_gate(x[1:24, 2:end, :]))
-    y = copy(x)
-    @views y[:, 2:end, :] .+= gate .* x[:, 1:end-1, :]
-    x = y
+    x = smear_embeddings(x, gate)
 
     x₀ = x
 
@@ -134,12 +145,13 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}; positions=noth
     backout_layer = n_layer ÷ 2 + 1
     for (i, block) in enumerate(ω.transformer.blocks)
         (; 🍰, λᵦ, λx₀) = block
-        x = @. λᵦ * x + λx₀ * x₀
+        x = @. F(λᵦ * x + λx₀ * x₀)
         # Get value embedding matrix from this block given tokens
         # We pull out embedding matrix here because we have tokens here, instead of 
         # passing token indexes down. 
         ve = isnothing(🍰) ? nothing : 🍰(tokens)
-        x = block(x, ve, sin_cos)
+        isnothing(ve) || eltype(ve) == F || (ve = F.(ve))
+        x = block(x, ve, sin_cos; attention_options)
         if i == backout_layer
             x_backout = x
         end
@@ -147,7 +159,7 @@ function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}; positions=noth
 
     if !isnothing(x_backout)
         # Subtract mid-layer residual to remove low-level features before logit projection
-        x = @. x - λᵧ * x_backout
+        x = @. F(x - λᵧ * x_backout)
     end
 
     x = norm(x)
@@ -181,8 +193,8 @@ Base.@constprop :aggressive function cross_entropy(logits::AbstractArray, target
     end
 end
 
-function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray; positions=nothing, reduction=:mean)
-    logits = ω(tokens; positions)
+function (ω::🤖)(tokens::Union{AbstractVector,AbstractMatrix}, targets::AbstractArray; positions=nothing, reduction=:mean, attention_options=(;))
+    logits = ω(tokens; positions, attention_options)
     cross_entropy(logits, targets; reduction)
 end
 

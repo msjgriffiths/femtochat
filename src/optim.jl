@@ -20,13 +20,22 @@ mutable struct AdamW{F<:AbstractFloat,V<:AbstractVector,I}
     λ::F
 end
 
-function AdamW(θ::AbstractVector; α=0.001, β₁=0.9, β₂=0.999, ϵ=1e-8, λ=0.01)
+function AdamW(θ::AbstractVector; α=0.001, β₁=0.9, β₂=0.999, ϵ=1e-8, λ=0.01, t=0)
     𝓂ₜ = similar(θ, Float32)
     𝓋ₜ = similar(θ, Float32)
     fill!(𝓂ₜ, 0f0)
     fill!(𝓋ₜ, 0f0)
 
-    AdamW(α, β₁, β₂, 𝓂ₜ, 𝓋ₜ, 0, ϵ, λ)
+    AdamW(α, β₁, β₂, 𝓂ₜ, 𝓋ₜ, t, ϵ, λ)
+end
+
+# Shared by the ordinary step and Reactant's in-place GPU writeback.
+function adam_moments!(ω::AdamW, gₜ; Nₜ=1f0)
+    (; β₁, β₂, 𝓂ₜ, 𝓋ₜ) = ω
+    ω.t += 1
+    @. 𝓂ₜ = β₁ * 𝓂ₜ + (1f0 - β₁) * (gₜ / Nₜ)
+    @. 𝓋ₜ = β₂ * 𝓋ₜ + (1f0 - β₂) * (gₜ / Nₜ)^2
+    nothing
 end
 
 """
@@ -63,11 +72,9 @@ we denote β₁ and β₂ to the power t.
 Weight decay: https://arxiv.org/abs/1711.05101
 
 """
-function (ω::AdamW)(θ, gₜ)
-    (; α, β₁, β₂, 𝓂ₜ, 𝓋ₜ, ϵ, λ) = ω
-    ω.t += 1
-    @. 𝓂ₜ = β₁ * 𝓂ₜ + (1f0 - β₁) * gₜ
-    @. 𝓋ₜ = β₂ * 𝓋ₜ + (1f0 - β₂) * gₜ^2
+function (ω::AdamW)(θ, gₜ; α=ω.α, Nₜ=1f0)
+    (; β₁, β₂, 𝓂ₜ, 𝓋ₜ, ϵ, λ) = ω
+    adam_moments!(ω,gₜ; Nₜ)
     
     # 𝓂̂ₜ = 𝓂ₜ ./ (1f0 - β₁^ω.t) # Avoid allocating
     # 𝓋̂ₜ = 𝓋ₜ ./ (1f0 - β₂^ω.t)  #  intermediate vectors
@@ -174,23 +181,30 @@ function Muon(
     fill!(𝓂ₜ, 0f0)
     fill!(𝓋ₜ, 0f0)
 
-    X = similar(𝓂ₜ)
-    work = (; X, polar=polar_workspace(X, compute_type),
-        row=similar(X,m,1,k), old=similar(X,1,1,k), new=similar(X,1,1,k),
-        v_mean=similar(𝓋ₜ), step_size=similar(𝓋ₜ), scaled=similar(𝓋ₜ))
+    work = muon_workspace(𝓂ₜ, 𝓋ₜ, compute_type)
     return Muon(α, μ, β₂, λ, steps, 𝓂ₜ, 𝓋ₜ, work)
 end
 
-function (ω::Muon)(θ, gₜ)
-    (; α, μ, β₂, λ, steps, 𝓂ₜ, 𝓋ₜ, work) = ω
+function muon_workspace(𝓂ₜ, 𝓋ₜ, compute_type)
+    m, n, k = size(𝓂ₜ)
+    X = similar(𝓂ₜ)
+    (; X, polar=polar_workspace(X, compute_type),
+        row=similar(X,m,1,k), old=similar(X,1,1,k), new=similar(X,1,1,k),
+        v_mean=similar(𝓋ₜ), step_size=similar(𝓋ₜ), scaled=similar(𝓋ₜ))
+end
+
+muon_workspace(ω::Muon) = ω.work
+
+function muon_direction!(ω::Muon, gₜ; μ=ω.μ, Nₜ=1f0)
+    (; β₂, steps, 𝓂ₜ, 𝓋ₜ) = ω
+    work = muon_workspace(ω)
     (; X, row, old, new, v_mean, step_size, scaled) = work
-    m, n = size(θ,1), size(θ,2)
-    θ = reshape(θ, size(𝓂ₜ))
+    m, n = size(𝓂ₜ,1), size(𝓂ₜ,2)
     gₜ = reshape(gₜ, size(𝓂ₜ))
 
     # Nesterov momentum
-    @. 𝓂ₜ = μ * 𝓂ₜ + (1f0 - μ) * gₜ
-    @. X = (1f0 - μ) * gₜ + μ * 𝓂ₜ
+    @. 𝓂ₜ = μ * 𝓂ₜ + (1f0 - μ) * (gₜ / Nₜ)
+    @. X = (1f0 - μ) * (gₜ / Nₜ) + μ * 𝓂ₜ
 
     # MuonEq row equilibration
     sum!(abs2, old, X)
@@ -218,6 +232,14 @@ function (ω::Muon)(θ, gₜ)
     sum!(new, scaled)
     @. X *= step_size * sqrt(old) / max(sqrt(new), 1f-10)
 
+    X
+end
+
+function (ω::Muon)(θ, gₜ; α=ω.α, μ=ω.μ, λ=ω.λ, Nₜ=1f0)
+    X = muon_direction!(ω, gₜ; μ, Nₜ)
+    m, n = size(X,1), size(X,2)
+    θ = reshape(θ, size(X))
+
     # Shape-adjusted learning rate and cautious decay
     η = α * √max(1f0, Float32(m) / Float32(n))
     @. θ -= η * X + η * λ * θ * ((X * θ) ≥ 0)
@@ -229,7 +251,9 @@ struct ParameterUpdate{O,P,G}
     ω::O
     θ::P
     δ::G
+    offset::Int # Location in Θ; views may be materialized while tracing.
 end
+ParameterUpdate(ω,θ,δ) = ParameterUpdate(ω,θ,δ,0)
 
 # Parameter storage stays flat; only the optimizer's working matrices are stacked.
 struct MuonGroup{U,P,I}
@@ -254,11 +278,11 @@ function scatter!(vector, stack, offsets)
     vector
 end
 
-function (group::MuonGroup)()
+function (group::MuonGroup)(; kwargs...)
     (; update, params, offsets) = group
     gather!(update.θ, params.Θ, offsets)
     gather!(update.δ, params.δ, offsets)
-    update()
+    update(; kwargs...)
     scatter!(params.Θ, update.θ, offsets)
     nothing
 end
@@ -271,12 +295,12 @@ function muon_group(params, specs; kwargs...)
     MuonGroup(ParameterUpdate(Muon(δ; kwargs...), θ, δ), params, offsets)
 end
 
-(update::ParameterUpdate)() = update.ω(update.θ, update.δ)
+(update::ParameterUpdate)(; kwargs...) = update.ω(update.θ, update.δ; kwargs...)
 
 function adamw_update(params::Params, spec; kwargs...)
     θ = vec(paramview(params.Θ, spec))
     δ = vec(paramview(params.δ, spec))
-    ParameterUpdate(AdamW(θ; kwargs...), θ, δ)
+    ParameterUpdate(AdamW(θ; kwargs...), θ, δ, first(spec.range)-1)
 end
 
 struct MuonAdamW{A,M}
@@ -301,6 +325,7 @@ function MuonAdamW(
     scalar_lr=0.5f0,
     smear_lr=0.2f0,
     compute_type=Float32,
+    t=0,
 )
     D = layout.transformer.embedding.shape[1]
     scale = √(768f0 / D)
@@ -313,6 +338,7 @@ function MuonAdamW(
         β₂=0.96f0,
         ϵ=1f-10,
         λ=0.01f0,
+        t,
     )]
 
     push!(adamw, adamw_update(
@@ -323,6 +349,7 @@ function MuonAdamW(
         β₂=0.995f0,
         ϵ=1f-10,
         λ=0.001f0,
+        t,
     ))
 
     for block in layout.transformer.blocks
@@ -335,6 +362,7 @@ function MuonAdamW(
                 β₂=0.995f0,
                 ϵ=1f-10,
                 λ=0.01f0,
+                t,
             ))
         end
 
@@ -346,6 +374,7 @@ function MuonAdamW(
             β₂=0.95f0,
             ϵ=1f-10,
             λ=0.05f0,
+            t,
         ))
 
         push!(adamw, adamw_update(
@@ -356,6 +385,7 @@ function MuonAdamW(
             β₂=0.95f0,
             ϵ=1f-10,
             λ=0f0,
+            t,
         ))
     end
 
@@ -368,6 +398,7 @@ function MuonAdamW(
             β₂=0.95f0,
             ϵ=1f-10,
             λ=0f0,
+            t,
         ))
     end
 
@@ -393,15 +424,17 @@ function MuonAdamW(
         for shape in shapes
     ]
 
-    return MuonAdamW(adamw, muon)
+    return MuonAdamW(Tuple(adamw), Tuple(muon))
 end
 
-function (ω::MuonAdamW)()
+function (ω::MuonAdamW)(; η=1f0, μ=nothing, λ=nothing, Nₜ=1f0)
     for update in ω.adamw
-        update()
+        update(; α=η * update.ω.α, Nₜ)
     end
     for update in ω.muon
-        update()
+        update(; α=η * update.update.ω.α, Nₜ,
+                 μ=isnothing(μ) ? update.update.ω.μ : μ,
+                 λ=isnothing(λ) ? update.update.ω.λ : λ)
     end
     return nothing
 end

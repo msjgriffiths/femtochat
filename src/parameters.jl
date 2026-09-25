@@ -136,6 +136,7 @@ struct Transformer{
 end
 
 struct 🤖{
+    F,
     P<:AbstractVector{<:Number},
     T<:Transformer,
     L<:Linear,
@@ -146,6 +147,7 @@ struct 🤖{
     R<:Tuple{AbstractMatrix{<:Number}, AbstractMatrix{<:Number}},
 }
     Θ::P
+    compute_type::Type{F}
     config::GPTConfig
 
     window_sizes::W
@@ -430,6 +432,8 @@ Construct a GPT model whose trainable tensors are zero-copy views into
 `params.Θ`.
 
 `layout` must have been generated from the same GPTConfig.
+`compute_type` selects activations and matrix multiplies without replacing Θ;
+for mixed precision, keep Params in Float32 and choose `compute_type=BFloat16`.
 """
 function 🤖(
     params::Params,
@@ -444,6 +448,7 @@ function 🤖(
     Θ::AbstractVector{<:Number},
     config::GPTConfig,
     layout;
+    compute_type=eltype(Θ),
     rope_sin_cos=rotary_embeddings(typeof(Θ),config.max_document_tokens,config.n_embed ÷ config.n_head),
 )
     length(Θ) == layout.nparams ||
@@ -480,6 +485,7 @@ function 🤖(
 
     🤖(
         Θ,
+        compute_type,
         config,
         window_sizes(config),
         layout.padded_vocab_size,

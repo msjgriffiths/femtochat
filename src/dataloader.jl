@@ -1,7 +1,7 @@
 module DataLoading
 
 using DuckDB: DB, StreamResult
-using DBInterface: connect, execute
+using DBInterface: connect, execute, close!
 using Tables: rows
 using ..Dataset: MAX_SHARD
 using ..Tokenizer: bos_token_id
@@ -46,6 +46,8 @@ mutable struct DataLoader{C}
     state::DataLoaderState
     connection::C
 end
+
+Base.close(loader::DataLoader) = close!(loader.connection)
 
 function DataLoader(
     files::AbstractVector{<:AbstractString};
@@ -153,17 +155,21 @@ mutable struct BatchIterator{L,T,I}
 end
 
 """
-Iterate over batches with at most one chunk from each document per batch.
+Iterate over packed batches, continuing long documents across batches.
 
 Returns `(tokens, targets, positions, sources, epoch)` as a named tuple. The
 three matrices have shape `(sequence_len, k)`; positions are zero-based within
-each BOS-prefixed document. Padding has target `-1` and position `0`. A source
-is the document's `DataLoaderState`, or `nothing` for an empty slot.
+each BOS-prefixed document. `sources[column]` maps each occupied row range to
+its document's `DataLoaderState`. Padding has target `-1` and position `0`.
 
-Each slot continues its document in the next batch. At an epoch boundary,
-active documents finish before the next epoch starts; unused slots are padded.
+Each column concatenates documents with BOS between them, with targets shifted
+by one token. Attention crosses document boundaries; positions restart at BOS.
+An unfinished document continues in the next batch without losing its tail.
+At an epoch boundary, active documents finish before the next epoch starts;
+only the final batches can contain padding. Each document's last token predicts
+BOS, including at epoch boundaries.
 Only the first `loader.max_document_tokens` tokens of each BOS-prefixed document
-are retained, yielding at most `loader.max_document_tokens - 1` targets.
+are retained.
 Pass positions to the model with `model(tokens, targets; positions)`.
 Existing `(tokens, targets)` destructuring remains supported.
 
@@ -178,6 +184,7 @@ function eachbatch(loader::DataLoader, tokenizer, k::Int, sequence_len::Int; sta
     batches = BatchIterator(loader, tokenizer, bos, sequence_len, slots, nothing, nothing, false)
 
     if !isnothing(state)
+        get(state, :packing, false) || error("Resume requires a packed-loader checkpoint")
         batches.slots = deepcopy(state.slots)
         batches.exhausted = state.exhausted
         loader.state = state.reader
@@ -188,6 +195,7 @@ end
 
 """Copy the next-read cursor and active documents; no live database iterator is saved."""
 batch_state(batches::BatchIterator) = (
+    packing=true,
     files=copy(batches.loader.files),
     rank=batches.loader.rank,
     world_size=batches.loader.world_size,
@@ -235,16 +243,31 @@ function model_batch!(batches::BatchIterator)
     tokens = fill(Int(bos), sequence_len, length(slots))
     targets = fill(-1, sequence_len, length(slots))
     positions = zeros(Int, sequence_len, length(slots))
-    sources = [isnothing(doc) ? nothing : doc.source for doc in slots]
+    sources = [Pair{UnitRange{Int},DataLoaderState}[] for _ in slots]
 
     for (column, doc) in enumerate(slots)
-        isnothing(doc) && continue
-        p = doc.position
-        n = min(sequence_len, length(doc.tokens) - 1 - p)
-        @views tokens[1:n, column] .= doc.tokens[p+1:p+n]
-        @views targets[1:n, column] .= doc.tokens[p+2:p+n+1]
-        positions[1:n, column] .= p .+ (0:n-1)
-        doc.position += n
+        row = 1
+        while row <= sequence_len && !isnothing(doc)
+            p = doc.position
+            n = min(sequence_len - row + 1, length(doc.tokens) - p)
+            block = row:row+n-1
+            @views begin
+                tokens[block, column] .= doc.tokens[p+1:p+n]
+                targets[row:row+n-2, column] .= doc.tokens[p+2:p+n]
+            end
+            positions[block, column] .= p .+ (0:n-1)
+            push!(sources[column], block => doc.source)
+            doc.position += n
+
+            if doc.position == length(doc.tokens)
+                doc = next_active_document!(batches)
+                targets[last(block), column] = Int(bos)
+            else
+                targets[last(block), column] = doc.tokens[doc.position+1]
+            end
+            row += n
+        end
+        slots[column] = doc
     end
 
     (; tokens, targets, positions, sources, epoch=batches.loader.state.epoch)
@@ -253,10 +276,6 @@ end
 function Base.iterate(batches::BatchIterator, ::Nothing=nothing)
     while true
         for column in eachindex(batches.slots)
-            doc = batches.slots[column]
-            if !isnothing(doc) && doc.position == length(doc.tokens) - 1
-                batches.slots[column] = nothing
-            end
             if isnothing(batches.slots[column])
                 batches.slots[column] = next_active_document!(batches)
             end

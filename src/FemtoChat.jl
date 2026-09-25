@@ -2,6 +2,8 @@ module FemtoChat
 
 include("parameters.jl")
 include("optim.jl")
+include("scaling.jl")
+include("checkpoints.jl")
 include("kernels.jl")
 include("gpt.jl")
 include("tokenizers.jl")
@@ -13,6 +15,8 @@ include("common.jl")
 
 using .Parameters
 using .Optimizer
+using .Scaling
+using .Checkpoints
 using .GPT: initialize!, cross_entropy
 using .Tokenizer
 using .Dataset
@@ -34,6 +38,15 @@ export Params,
        AdamW,
        Muon,
        MuonAdamW,
+       num_scaling_params,
+       num_matmul_params,
+       estimate_flops,
+       training_scaling,
+       training_schedule,
+       save_checkpoint,
+       load_checkpoint,
+       optimizer_state,
+       restore_optimizer!,
        polar_express,
        GPTConfig,
        parameter_layout,
