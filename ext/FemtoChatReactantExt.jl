@@ -340,4 +340,6 @@ function __init__()
     Reactant.@skip_rewrite_func cpu_backend
 end
 
+include("reactant/training_gradient.jl")
+
 end

@@ -1,5 +1,8 @@
 module FemtoChat
 
+using Preferences: @load_preference
+const _precompile_training_gradient = @load_preference("precompile_training_gradient", false)
+
 include("parameters.jl")
 include("optim.jl")
 include("scaling.jl")
