@@ -83,3 +83,34 @@ let
     end
 end
 ```
+
+### Precompiling the training gradient
+
+The RunPod image compiles a small BF16 gradient on CPU while building the container. Julia saves the host method specializations reached by Reactant in the package cache. A fresh training process loads those methods from the depot and compiles the real graph for its shapes and GPU.
+
+From the repository root, build the image for an x86-64 pod. Choose a CUDA version supported by the pod driver and the pinned Reactant build.
+
+```sh
+docker buildx build --platform linux/amd64 -f environments/runpod/Dockerfile \
+    --build-arg CUDA_VERSION=12.9 -t "ghcr.io/msjgriffiths/femtochat:$(git rev-parse --short HEAD)" --push .
+```
+
+Set the RunPod template to the published image. Mount the tokenizer at `/opt/femtochat/my_tok.bin`, the training shards at `/opt/femtochat/data/climbmix-400b-shuffle`, and the checkpoints volume at `/opt/femtochat/checkpoints`, or pass those paths to `train` explicitly.
+
+To enable the same workload in another build, set the following preference in the active project's `LocalPreferences.toml`.
+
+```toml
+[FemtoChat]
+precompile_training_gradient = true
+```
+
+Run `julia --project=. -e 'using Pkg; Pkg.instantiate(); using FemtoChat, Enzyme, CUDA, Reactant'` during the image build. For an NVIDIA deployment, select the matching CUDA artifacts first and build the adapters in `deps/reactant` against the selected Reactant library. Retain the Julia depot and checkout paths in the container. The supplied Dockerfile sets `JULIA_CPU_TARGET=generic` to share the native host cache across compatible x86-64 CPUs.
+
+`scripts/train.jl` reports the first synchronized gradient after attention setup and device input synchronization. The first real microbatch supplies that gradient. The trainer then compiles accumulation when needed and prepares the optimizer for the first update.
+
+For a CPU comparison, run the command below in separate fresh processes with the workload preference set to `false` and `true`. Use different output filenames and compare them with `cmp` to check every parameter gradient. Pass depth `8` to exercise a depth outside the two-layer build workload.
+
+```sh
+OPENBLAS_NUM_THREADS=1 julia --project=. --startup-file=no --threads=1 \
+    scripts/measure_first_gradient.jl 2 /tmp/gradient.f32 --check-accumulation
+```

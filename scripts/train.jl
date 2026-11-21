@@ -5,7 +5,6 @@ using FemtoChat: Tokenizer
 using FemtoChat: training_scaling, training_schedule, estimate_flops, save_checkpoint,
                 load_checkpoint, restore_optimizer!
 using Reactant, Enzyme, CUDA, Random, SHA
-using Enzyme: ReverseWithPrimal, Const, Active, Duplicated
 using Reactant: @compile, to_rarray, ConcreteRArray, ReactantRNG
 using Core: BFloat16
 
@@ -113,39 +112,40 @@ function train(;
         extension = Base.get_extension(FemtoChat, :FemtoChatReactantExt)
         extension.prepare_attention(config, tokens; compute_type, attention_options...)
 
-        started = time()
-        ∇ℒ₀!, ∇ℒ! = let model=model, params=params, attention_options=attention_options
-            ℒ = (tokens, targets, positions) -> model(tokens, targets; positions, reduction=:sum, attention_options)
-            map((true, false)) do reset
-                # Overwrite on the first microbatch; later calls accumulate.
-                @compile sync=false ((tokens, targets, positions) -> begin
-                    # Keep accumulation outside AD so XLA can reuse δ without copying it back.
-                    δ₀ = reset ? nothing : copy(params.δ)
-                    fill!(params.δ, 0f0)
-                    result = Enzyme.autodiff(ReverseWithPrimal, Duplicated(ℒ, params), Active,
-                        Const(tokens), Const(targets), Const(positions))
-                    reset || (params.δ .+= δ₀)
-                    result
-                end)(tokens, targets, positions)
-            end
-        end
-        η, μ, λ, Nₜ = to_rarray.((1f0, .85f0, scaling.λ, Float32(tokens_per_batch)); track_numbers=Number)
-        update! = @compile sync=false ((η, μ, λ, Nₜ) -> ω(; η, μ, λ, Nₜ))(η, μ, λ, Nₜ)
-        @info "Compiled training" seconds=time()-started parameters=layout.nparams compute_type micro_steps total_batch_size attention_options
+        Reactant.synchronize((Θ, δ, model.rope_sin_cos..., tokens, targets, positions))
+        gradient_started = time_ns()
+        ∇ℒ₀! = extension.compile_training_gradient(model, params, tokens, targets, positions;
+            reset=true, attention_options)
 
         open(joinpath(output, "training-$(step₀).csv"), "w") do log
+            ∇ℒ! = update! = nothing
             for step in step₀+1:last_step
                 Reactant.synchronize(Θ)
                 started = time()
                 ℒₜ = 0f0
                 Nₜ = 0
                 for micro_step in 1:micro_steps
-                    if step != step₀+1 || micro_step != 1
+                    first_microbatch = step == step₀+1 && micro_step == 1
+                    if !first_microbatch
                         batch = take!(ready)
                         tokens, targets, positions = to_rarray.((batch.tokens, batch.targets, batch.positions))
                     end
                     Nₜ += batch.Nₜ
                     _, ℒₛ = (micro_step == 1 ? ∇ℒ₀! : ∇ℒ!)(tokens, targets, positions)
+                    if first_microbatch
+                        Reactant.synchronize(δ)
+                        extension.ReactantCUDACall.check()
+                        followup_started = time()
+                        @info "First gradient ready" seconds=(time_ns()-gradient_started)/1e9 parameters=layout.nparams compute_type
+                        if micro_steps > 1
+                            ∇ℒ! = extension.compile_training_gradient(model, params, tokens, targets, positions;
+                                reset=false, attention_options)
+                        end
+                        η₀, μ₀, λ₀, N₀ = to_rarray.((1f0, .85f0, scaling.λ, Float32(tokens_per_batch)); track_numbers=Number)
+                        update! = @compile sync=false ((η, μ, λ, Nₜ) -> ω(; η, μ, λ, Nₜ))(η₀, μ₀, λ₀, N₀)
+                        # Keep one-time compilation out of step throughput and checkpoint training time.
+                        started += time() - followup_started
+                    end
                     ℒₜ += ℒₛ
                 end
                 Nₜ > 0 || error("Batch has no training targets")

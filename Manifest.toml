@@ -2,7 +2,7 @@
 
 julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "07cf006282efae618906e0d982a05fc664172a65"
+project_hash = "b3daa6ec8e0bd91a346b662f8c370441549e9e4b"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -274,7 +274,7 @@ uuid = "21656369-7473-754a-2065-74616d696c43"
 version = "1.1.5"
 
 [[deps.FemtoChat]]
-deps = ["CUDA", "DBInterface", "Downloads", "DuckDB", "Enzyme", "LinearAlgebra", "Printf", "Random", "Serialization", "Tables"]
+deps = ["CUDA", "DBInterface", "Downloads", "DuckDB", "Enzyme", "LinearAlgebra", "PrecompileTools", "Preferences", "Printf", "Random", "Serialization", "Tables"]
 path = "."
 uuid = "e5abf5ee-30ff-476c-be51-c704643a2f2a"
 version = "0.1.0"
